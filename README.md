@@ -1,6 +1,6 @@
 # OpenClaw Admin
 
-OpenClaw 管理后台 — 一个基于 React + Vite 的本地 Web UI，用于查看 OpenClaw 的运行状态、会话、记忆库、能力中心（插件/技能/扩展）、定时任务、系统配置和日志。
+OpenClaw 管理后台 — 一个基于 React + Vite 的本地 Web UI，用于查看 OpenClaw 的运行状态、会话、记忆库、能力中心（插件/技能/扩展）、定时任务、用量分析、系统配置和日志。
 
 > ⚠️ 本项目为 **dev 模式本地预览** 设计，API 中间层是 Vite 插件，仅在 `npm run dev` 时生效。生产部署需要额外搭建后端服务。
 
@@ -60,6 +60,7 @@ OPENCLAW_HOME=/your/path npm run dev
 | 会话/Agent | `~/.openclaw/agents/main/sessions/sessions.json` |
 | 定时任务 | `~/.openclaw/state/openclaw.sqlite` 的 `cron_jobs` 表 |
 | 任务执行记录 | `~/.openclaw/state/openclaw.sqlite` 的 `cron_run_logs` 表 |
+| 用量数据 | `~/.openclaw/agents/*/sessions/*.jsonl` 的 `message.usage` 字段 |
 | 插件 | 硬编码已知启用列表 + 扫描 `agents/main/agent/plugins/` |
 | 技能 | 扫描 `~/.openclaw/skills/` + `workspace/skills/` |
 | 扩展 | 扫描 `~/.openclaw/extensions/` |
@@ -72,13 +73,21 @@ OPENCLAW_HOME=/your/path npm run dev
 
 | 路径 | 页面 | 刷新机制 |
 |---|---|---|
-| `/` | 仪表盘 | 30 秒自动轮询 |
+| `/` | 仪表盘（状态卡片 + 数据源连接状态 + Agent/Cron 概览） | 30 秒自动轮询 |
 | `/agents` | Agent 管理（会话、Token、Cron） | 30 秒自动轮询 |
 | `/capabilities` | 能力中心（插件/技能/扩展） | 30 秒自动轮询 |
-| `/cron` | 定时任务（任务列表 + 执行历史） | 30 秒自动轮询 |
+| `/cron` | 定时任务（任务列表 + 执行历史 + 健康状态机） | 30 秒自动轮询 |
+| `/usage` | 用量中心（Token/花费趋势 + 多维度拆分） | 30 秒自动轮询 |
 | `/memory` | 记忆库（架构、向量、文件、经验） | 30 秒自动轮询 |
 | `/config` | 系统配置（只读，敏感字段脱敏） | 30 秒自动轮询 |
 | `/logs` | 日志中心（网关/命令/错误/稳定性/审计） | 30 秒自动轮询 |
+
+### 核心特性
+
+- **数据源连接状态**：仪表盘顶部展示 11 个数据源的健康度（connected/partial/not_connected），未连接的给出修复建议
+- **Cron 健康状态机**：定时任务页用 5 态徽章标识每个任务的健康度（scheduled 已排期 / due 到期 / late 迟到 / unknown 未知 / disabled 已禁用），late 优先排序
+- **用量分析**：用量中心扫描 session 日志的 `message.usage` 字段，按今日/近7天/近30天展示 token 与花费趋势，支持按 Agent / 模型 / Provider / 会话类型 / Cron 任务多维度拆分
+- **通知中心**：顶栏铃铛聚合 Cron 失败、Cron 禁用、稳定性事件、配置审计 4 类通知，60 秒轮询 + 点击跳转
 
 ## 常用命令
 
