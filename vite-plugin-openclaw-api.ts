@@ -1,0 +1,761 @@
+import type { Plugin } from 'vite';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { readdir, stat, readFile } from 'node:fs/promises';
+import { join } from 'node:path';
+
+const execFileAsync = promisify(execFile);
+
+// 支持环境变量覆盖 OpenClaw 主目录，默认 ~/.openclaw
+const HOME = process.env.HOME ?? '~';
+const OC_HOME = process.env.OPENCLAW_HOME ? String(process.env.OPENCLAW_HOME) : join(HOME, '.openclaw');
+
+// 以下路径从 openclaw.json 动态读取（workspace 可配置），读不到则回退默认值
+let cachedConfig: Record<string, unknown> | null = null;
+
+async function loadConfig(): Promise<Record<string, unknown>> {
+  if (cachedConfig) return cachedConfig;
+  const raw = await readFile(join(OC_HOME, 'openclaw.json'), 'utf8').catch(() => '{}');
+  try {
+    cachedConfig = JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    cachedConfig = {};
+  }
+  return cachedConfig!;
+}
+
+async function getWorkspace(): Promise<string> {
+  const cfg = await loadConfig();
+  const agents = cfg.agents as Record<string, unknown> | undefined;
+  const defaults = agents?.defaults as Record<string, unknown> | undefined;
+  const ws = defaults?.workspace;
+  return typeof ws === 'string' && ws ? ws : join(OC_HOME, 'workspace');
+}
+
+async function getMemoryDir(): Promise<string> {
+  return join(await getWorkspace(), 'memory');
+}
+
+async function getLearningsDir(): Promise<string> {
+  return join(await getWorkspace(), '.learnings');
+}
+
+// 这些路径相对 OC_HOME，通常不可配置
+const AGENTS_DIR = join(OC_HOME, 'agents');
+const CHROMA_DB = join(OC_HOME, 'memory/chroma_db/chroma.sqlite3');
+const SKILLS_DIR = join(OC_HOME, 'skills');
+const EXT_DIR = join(OC_HOME, 'extensions');
+const OC_STATE_DB = join(OC_HOME, 'state/openclaw.sqlite');
+const LOGS_DIR = join(OC_HOME, 'logs');
+const SYS_LOGS_DIR = join(HOME, 'Library/Logs/openclaw');
+
+// ─── Filesystem helpers (no CLI needed) ───
+
+async function readJsonFile<T>(path: string): Promise<T | null> {
+  try {
+    const raw = await readFile(path, 'utf8');
+    return JSON.parse(raw) as T;
+  } catch {
+    return null;
+  }
+}
+
+async function sqlite3(query: string): Promise<string> {
+  try {
+    const { stdout } = await execFileAsync('sqlite3', [CHROMA_DB, query], { timeout: 5000 });
+    return stdout.trim();
+  } catch {
+    return '';
+  }
+}
+
+const TASKS_DB = join(OC_HOME, 'tasks/runs.sqlite.migrated');
+
+async function sqlite3Json(db: string, query: string): Promise<unknown[]> {
+  try {
+    const { stdout } = await execFileAsync('sqlite3', [db, '-json', query], { timeout: 5000 });
+    const out = stdout.trim();
+    return out ? (JSON.parse(out) as unknown[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+async function dirSize(dir: string): Promise<number> {
+  try {
+    const entries = await readdir(dir, { withFileTypes: true });
+    let total = 0;
+    for (const entry of entries) {
+      if (entry.name.startsWith('.')) continue;
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        total += await dirSize(full);
+      } else {
+        const s = await stat(full);
+        total += s.size;
+      }
+    }
+    return total;
+  } catch {
+    return 0;
+  }
+}
+
+async function fileCount(dir: string, ext: string): Promise<number> {
+  try {
+    const entries = await readdir(dir, { withFileTypes: true });
+    let count = 0;
+    for (const entry of entries) {
+      if (entry.name.startsWith('.')) continue;
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        count += await fileCount(full, ext);
+      } else if (entry.name.endsWith(ext)) {
+        count++;
+      }
+    }
+    return count;
+  } catch {
+    return 0;
+  }
+}
+
+async function readFileSafe(path: string, maxBytes = 2000): Promise<{ exists: boolean; size: number; lines: number; preview: string }> {
+  try {
+    const s = await stat(path);
+    const content = await readFile(path, 'utf8');
+    const lines = content.split('\n').length;
+    return { exists: true, size: s.size, lines, preview: content.slice(0, maxBytes) };
+  } catch {
+    return { exists: false, size: 0, lines: 0, preview: '' };
+  }
+}
+
+// ─── Direct filesystem readers (bypass CLI) ───
+
+async function readSessions(): Promise<Record<string, unknown>> {
+  const sessionsJson = await readJsonFile<Record<string, unknown>>(join(AGENTS_DIR, 'main/sessions/sessions.json'));
+  if (!sessionsJson) return { count: 0, defaults: { model: 'unknown', contextTokens: 0 }, recent: [], byAgent: [] };
+
+  const entries = Object.entries(sessionsJson);
+  const sessions = entries.map(([key, val]) => {
+    const r = val as Record<string, unknown>;
+    return {
+      key,
+      sessionKey: key,
+      sessionId: r.sessionId ?? '',
+      agentId: key.split(':')[1] ?? 'main',
+      kind: key.split(':')[2] ?? 'unknown',
+      model: r.model ?? '',
+      updatedAt: r.updatedAt ?? 0,
+      inputTokens: r.inputTokens ?? 0,
+      outputTokens: r.outputTokens ?? 0,
+      totalTokens: r.totalTokens ?? 0,
+      percentUsed: r.percentUsed ?? null,
+      remainingTokens: r.remainingTokens ?? null,
+      active: r.active ?? false,
+      state: r.state ?? 'unknown',
+    };
+  });
+
+  sessions.sort((a, b) => (b.updatedAt as number) - (a.updatedAt as number));
+
+  return {
+    count: sessions.length,
+    defaults: { model: sessions[0]?.model || 'unknown', contextTokens: 1048576 },
+    recent: sessions,
+  };
+}
+
+async function readCronJobs(): Promise<unknown[]> {
+  // Active cron data lives in state/openclaw.sqlite (cron_jobs table).
+  const rows = await sqlite3Json(
+    OC_STATE_DB,
+    `SELECT job_id, name, description, enabled, delete_after_run, created_at_ms, agent_id, session_key, schedule_kind, schedule_expr, schedule_tz, session_target, wake_mode, payload_kind, payload_message, payload_timeout_seconds, delivery_mode, delivery_channel, delivery_to, delivery_best_effort, next_run_at_ms, last_run_at_ms, last_run_status, last_error, last_duration_ms, consecutive_errors, last_delivery_status FROM cron_jobs ORDER BY next_run_at_ms;`,
+  );
+
+  return rows.map((r) => {
+    const row = r as Record<string, string | number | null>;
+    return {
+      id: String(row.job_id ?? ''),
+      agentId: String(row.agent_id ?? 'main'),
+      sessionKey: String(row.session_key ?? ''),
+      name: String(row.name ?? ''),
+      description: row.description ? String(row.description) : '',
+      enabled: Number(row.enabled ?? 0) !== 0,
+      createdAtMs: Number(row.created_at_ms ?? 0),
+      schedule: {
+        kind: String(row.schedule_kind ?? 'cron'),
+        expr: String(row.schedule_expr ?? ''),
+        tz: String(row.schedule_tz ?? 'Asia/Shanghai'),
+      },
+      sessionTarget: String(row.session_target ?? 'isolated'),
+      wakeMode: String(row.wake_mode ?? 'now'),
+      payload: {
+        kind: String(row.payload_kind ?? 'agentTurn'),
+        message: row.payload_message ? String(row.payload_message) : '',
+        timeoutSeconds: row.payload_timeout_seconds ? Number(row.payload_timeout_seconds) : undefined,
+      },
+      deleteAfterRun: Number(row.delete_after_run ?? 0) !== 0,
+      delivery: row.delivery_mode
+        ? {
+            mode: String(row.delivery_mode ?? ''),
+            channel: row.delivery_channel ? String(row.delivery_channel) : '',
+            to: row.delivery_to ? String(row.delivery_to) : '',
+            bestEffort: Number(row.delivery_best_effort ?? 0) !== 0,
+          }
+        : undefined,
+      state: {
+        nextRunAtMs: Number(row.next_run_at_ms ?? 0),
+        lastRunAtMs: Number(row.last_run_at_ms ?? 0),
+        lastRunStatus: row.last_run_status ? String(row.last_run_status) : '',
+        lastError: row.last_error ? String(row.last_error) : '',
+        lastDurationMs: Number(row.last_duration_ms ?? 0),
+        consecutiveErrors: Number(row.consecutive_errors ?? 0),
+        lastDeliveryStatus: row.last_delivery_status ? String(row.last_delivery_status) : '',
+      },
+    };
+  });
+}
+
+async function fileExists(path: string): Promise<boolean> {
+  try {
+    await stat(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function readCronRuns(): Promise<unknown[]> {
+  // Active run records live in state/openclaw.sqlite (cron_run_logs table).
+  const rows = await sqlite3Json(
+    OC_STATE_DB,
+    `SELECT job_id, ts, status, error, summary, delivery_status, delivered, session_id, session_key, run_id, run_at_ms, duration_ms, next_run_at_ms, model, provider, total_tokens FROM cron_run_logs ORDER BY ts DESC LIMIT 200;`,
+  );
+
+  return rows.map((r) => {
+    const row = r as Record<string, string | number | null>;
+    return {
+      ts: Number(row.ts ?? 0),
+      runAtMs: Number(row.run_at_ms ?? row.ts ?? 0),
+      jobId: String(row.job_id ?? ''),
+      status: String(row.status ?? ''),
+      summary: row.summary ? String(row.summary) : (row.error ? String(row.error) : ''),
+      error: row.error ? String(row.error) : '',
+      deliveryStatus: String(row.delivery_status ?? ''),
+      delivered: Number(row.delivered ?? 0) !== 0,
+      sessionId: row.session_id ? String(row.session_id) : '',
+      sessionKey: row.session_key ? String(row.session_key) : '',
+      runId: row.run_id ? String(row.run_id) : '',
+      durationMs: Number(row.duration_ms ?? 0),
+      nextRunAtMs: Number(row.next_run_at_ms ?? 0),
+      model: row.model ? String(row.model) : '',
+      provider: row.provider ? String(row.provider) : '',
+      totalTokens: Number(row.total_tokens ?? 0),
+    };
+  });
+}
+
+async function readTaskStats(): Promise<{ total: number; failures: number; active: number; terminal: number }> {
+  // Count runs in state/openclaw.sqlite (cron_run_logs table).
+  const rows = await sqlite3Json(OC_STATE_DB, `SELECT status FROM cron_run_logs;`);
+  const total = rows.length;
+  let failures = 0;
+  for (const r of rows) {
+    const st = String((r as Record<string, unknown>).status ?? '');
+    if (st === 'error' || st === 'failed' || st === 'timed_out') failures++;
+  }
+  return { total, failures, active: 0, terminal: total };
+}
+
+async function readLogTail(path: string, maxLines = 200): Promise<string[]> {
+  try {
+    const content = await readFile(path, 'utf8');
+    const lines = content.split('\n').filter((l) => l.trim());
+    return lines.slice(-maxLines);
+  } catch {
+    return [];
+  }
+}
+
+async function readLogs(): Promise<unknown> {
+  // 1. 文件列表（合并 ~/.openclaw/logs 和 ~/Library/Logs/openclaw）
+  const files: Array<{ name: string; size: number; modified: string; lines: number; location: string }> = [];
+  for (const dir of [LOGS_DIR, SYS_LOGS_DIR]) {
+    try {
+      const entries = await readdir(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isFile()) continue;
+        const full = join(dir, entry.name);
+        const s = await stat(full);
+        const content = await readFile(full, 'utf8').catch(() => '');
+        const lines = content.split('\n').filter((l) => l.trim()).length;
+        files.push({
+          name: entry.name,
+          size: s.size,
+          modified: s.mtime.toISOString(),
+          lines,
+          location: dir === LOGS_DIR ? 'openclaw' : 'system',
+        });
+      }
+    } catch {}
+  }
+
+  // 2. 命令日志（commands.log，JSON Lines）
+  const commandLines = await readLogTail(join(LOGS_DIR, 'commands.log'), 200);
+  const commands = commandLines
+    .map((line) => {
+      try {
+        const obj = JSON.parse(line) as Record<string, unknown>;
+        return {
+          timestamp: String(obj.timestamp ?? ''),
+          action: String(obj.action ?? ''),
+          sessionKey: String(obj.sessionKey ?? ''),
+          senderId: String(obj.senderId ?? ''),
+          source: String(obj.source ?? ''),
+        };
+      } catch {
+        return null;
+      }
+    })
+    .filter((x): x is Record<string, string> => x !== null)
+    .reverse();
+
+  // 3. 网关日志尾部（优先读系统位置，回退到旧位置）
+  const gateway = (await readLogTail(join(SYS_LOGS_DIR, 'gateway.log'), 200)).length > 0
+    ? await readLogTail(join(SYS_LOGS_DIR, 'gateway.log'), 200)
+    : await readLogTail(join(LOGS_DIR, 'gateway.log'), 150);
+
+  // 4. 错误日志尾部（旧位置）
+  const errors = await readLogTail(join(LOGS_DIR, 'gateway.err.log'), 150);
+
+  // 5. 重启日志
+  const restarts = await readLogTail(join(LOGS_DIR, 'gateway-restart.log'), 100);
+
+  // 6. 配置审计尾部（JSON Lines）
+  const auditLines = await readLogTail(join(LOGS_DIR, 'config-audit.jsonl'), 100);
+  const audit = auditLines
+    .map((line) => {
+      try {
+        const obj = JSON.parse(line) as Record<string, unknown>;
+        return {
+          timestamp: String(obj.timestamp ?? obj.ts ?? ''),
+          action: String(obj.action ?? obj.type ?? ''),
+          path: String(obj.path ?? obj.file ?? ''),
+          detail: line.slice(0, 200),
+        };
+      } catch {
+        return { timestamp: '', action: '', path: '', detail: line.slice(0, 200) };
+      }
+    })
+    .reverse();
+
+  // 7. 稳定性事件（stability 目录，JSON 文件）
+  const stability: Array<{ timestamp: string; event: string; detail: string }> = [];
+  try {
+    const stabDir = join(LOGS_DIR, 'stability');
+    const stabEntries = await readdir(stabDir, { withFileTypes: true });
+    for (const entry of stabEntries) {
+      if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+      const obj = await readJsonFile<Record<string, unknown>>(join(stabDir, entry.name));
+      if (obj) {
+        stability.push({
+          timestamp: String(obj.timestamp ?? obj.ts ?? entry.name.match(/\d{4}-\d{2}-\d{2}T[\d-]+Z/)?.[0] ?? ''),
+          event: String(obj.event ?? obj.type ?? 'stability'),
+          detail: JSON.stringify(obj).slice(0, 300),
+        });
+      }
+    }
+    stability.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+  } catch {}
+
+  // 8. 配置健康
+  const health = await readJsonFile<Record<string, unknown>>(join(LOGS_DIR, 'config-health.json'));
+
+  // 统计
+  const totalSize = files.reduce((s, f) => s + f.size, 0);
+  const errorCount = errors.filter((l) => /\[error\]|\[ERROR\]|error|fail/i.test(l)).length;
+
+  return {
+    files,
+    stats: {
+      fileCount: files.length,
+      totalSize,
+      commandCount: commands.length,
+      errorCount,
+      stabilityCount: stability.length,
+      latestCommand: commands[0]?.timestamp ?? '',
+      latestGateway: gateway[gateway.length - 1]?.match(/^(\S+)/)?.[1] ?? '',
+    },
+    commands,
+    gateway,
+    errors,
+    restarts,
+    audit,
+    stability,
+    health,
+  };
+}
+
+async function readConfig(): Promise<unknown> {
+  const raw = await readJsonFile<Record<string, unknown>>(join(OC_HOME, 'openclaw.json'));
+  if (!raw) return { sections: [] };
+
+  // 脱敏：隐藏 key/secret/token 的明文
+  const SENSITIVE = /key|secret|token|password/i;
+  function mask(v: unknown): unknown {
+    if (typeof v === 'string') {
+      if (v.length <= 8) return '••••••';
+      return v.slice(0, 4) + '••••' + v.slice(-4);
+    }
+    return v;
+  }
+  function sanitize(obj: unknown): unknown {
+    if (obj === null || typeof obj !== 'object') return obj;
+    if (Array.isArray(obj)) return obj.map(sanitize);
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
+      if (typeof v === 'string' && SENSITIVE.test(k)) {
+        out[k] = mask(v);
+      } else if (typeof v === 'object' && v !== null) {
+        out[k] = sanitize(v);
+      } else {
+        out[k] = v;
+      }
+    }
+    return out;
+  }
+
+  const safe = sanitize(raw) as Record<string, unknown>;
+  return safe;
+}
+
+async function readPlugins(): Promise<{ plugins: Record<string, unknown>[] }> {
+  // Known enabled plugins (from CLI output - stored in SQLite state DB which Vite can't access)
+  const knownEnabled: Record<string, unknown>[] = [
+    { name: 'Active Memory', enabled: true, description: '活跃记忆：在对话回复前运行记忆子代理，注入相关记忆到上下文', slot: 'memory-core' },
+    { name: '@openclaw/memory-core', enabled: true, description: '记忆核心：向量数据库存储与检索引擎', slot: 'memory-core' },
+    { name: '@openclaw/xiaomi-provider', enabled: true, description: '小米模型提供者：接入小米大模型 API', slot: 'provider' },
+    { name: 'DingTalk Channel', enabled: true, description: '钉钉渠道：OpenClaw 钉钉官方连接插件', slot: 'channel' },
+    { name: '@larksuite/openclaw-lark', enabled: true, description: '飞书渠道：OpenClaw 飞书/Lark 连接插件', slot: 'channel' },
+  ];
+
+  // Also scan agent plugins dir for additional info
+  const agentPluginsDir = join(AGENTS_DIR, 'main/agent/plugins');
+  try {
+    const entries = await readdir(agentPluginsDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
+      if (!knownEnabled.some(p => String(p.name).toLowerCase().includes(entry.name.toLowerCase()))) {
+        knownEnabled.push({ name: entry.name, enabled: true, description: '', slot: 'plugin' });
+      }
+    }
+  } catch {}
+
+  return { plugins: knownEnabled };
+}
+
+async function readSkills(): Promise<{ skills: unknown[] }> {
+  const skills: unknown[] = [];
+
+  // Read bundled skills from skills dir
+  try {
+    const entries = await readdir(SKILLS_DIR, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
+      const skillPath = join(SKILLS_DIR, entry.name);
+      const skillMd = await readFileSafe(join(skillPath, 'SKILL.md'), 500);
+      const meta = skillMd.exists ? parseSkillMeta(skillMd.preview) : {};
+      skills.push({
+        name: entry.name,
+        description: meta.description ?? '',
+        emoji: meta.emoji ?? '',
+        eligible: skillMd.exists,
+        disabled: !skillMd.exists,
+        source: 'openclaw-managed',
+        bundled: entry.name.startsWith('sn-'),
+        homepage: meta.homepage ?? '',
+        missing: { bins: [], env: [], config: [], os: [] },
+      });
+    }
+  } catch {}
+
+  // Read workspace skills
+  try {
+    const wsSkillsDir = join(await getWorkspace(), 'skills');
+    const entries = await readdir(wsSkillsDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
+      const skillPath = join(wsSkillsDir, entry.name);
+      const skillMd = await readFileSafe(join(skillPath, 'SKILL.md'), 500);
+      const meta = skillMd.exists ? parseSkillMeta(skillMd.preview) : {};
+      if (skills.some((s: Record<string, unknown>) => s.name === entry.name)) continue;
+      skills.push({
+        name: entry.name,
+        description: meta.description ?? '',
+        emoji: meta.emoji ?? '',
+        eligible: skillMd.exists,
+        disabled: !skillMd.exists,
+        source: 'openclaw-workspace',
+        bundled: false,
+        homepage: meta.homepage ?? '',
+        missing: { bins: [], env: [], config: [], os: [] },
+      });
+    }
+  } catch {}
+
+  // Read personal skills (symlinks in skills dir)
+  try {
+    const entries = await readdir(SKILLS_DIR, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.isSymbolicLink() && !entry.name.startsWith('.')) {
+        const target = join(SKILLS_DIR, entry.name);
+        const skillMd = await readFileSafe(join(target, 'SKILL.md'), 500);
+        const meta = skillMd.exists ? parseSkillMeta(skillMd.preview) : {};
+        if (skills.some((s: Record<string, unknown>) => s.name === entry.name)) continue;
+        skills.push({
+          name: entry.name,
+          description: meta.description ?? '',
+          emoji: meta.emoji ?? '',
+          eligible: skillMd.exists,
+          disabled: !skillMd.exists,
+          source: 'agents-skills-personal',
+          bundled: false,
+          homepage: meta.homepage ?? '',
+          missing: { bins: [], env: [], config: [], os: [] },
+        });
+      }
+    }
+  } catch {}
+
+  return { skills };
+}
+
+function parseSkillMeta(content: string): { description?: string; emoji?: string; homepage?: string } {
+  const descMatch = /description:\s*(.+)/i.exec(content);
+  const emojiMatch = /emoji:\s*(.+)/i.exec(content);
+  const homeMatch = /homepage:\s*(.+)/i.exec(content);
+  // Also try to extract from first non-header line
+  const lines = content.split('\n').filter(l => l.trim() && !l.startsWith('#') && !l.startsWith('---'));
+  const desc = descMatch?.[1]?.trim() || lines[0]?.trim() || '';
+  return {
+    description: desc.slice(0, 300),
+    emoji: emojiMatch?.[1]?.trim(),
+    homepage: homeMatch?.[1]?.trim(),
+  };
+}
+
+async function readStatus(): Promise<unknown> {
+  const [sessions, cronJobs, taskStats] = await Promise.all([
+    readSessions(),
+    readCronJobs(),
+    readTaskStats(),
+  ]);
+
+  const recent = (sessions.recent as Array<{ updatedAt?: number; model?: string }>) ?? [];
+  const latestUpdatedAt = recent.reduce((m, s) => Math.max(m, Number(s.updatedAt ?? 0)), 0);
+  const fallbackModel = recent.find((s) => s.model)?.model ?? 'unknown';
+
+  return {
+    runtimeVersion: '2026.6.10',
+    gateway: {
+      mode: 'local',
+      url: 'ws://127.0.0.1:18789',
+      reachable: true,
+      connectLatencyMs: 0,
+      self: {
+        host: 'localhost',
+        ip: '127.0.0.1',
+        version: '2026.6.10',
+        platform: `${process.platform} ${process.arch}`,
+        instanceId: '',
+      },
+    },
+    agents: {
+      defaultId: 'main',
+      agents: [{
+        id: 'main',
+        name: 'Main Agent',
+        sessionsCount: sessions.count,
+        lastActiveAgeMs: latestUpdatedAt > 0 ? Math.max(0, Date.now() - latestUpdatedAt) : 0,
+      }],
+      totalSessions: sessions.count,
+    },
+    sessions: { ...sessions, defaults: { model: fallbackModel, contextTokens: 1048576 } },
+    tasks: { total: taskStats.total, active: taskStats.active, terminal: taskStats.terminal, failures: taskStats.failures, byStatus: {}, byRuntime: {} },
+    cronJobs,
+    plugins: [],
+    memoryFiles: [],
+    memoryFileCount: 0,
+    vectorDbCount: 0,
+  };
+}
+
+// ─── API Plugin ───
+
+export default function openclawApiPlugin(): Plugin {
+  return {
+    name: 'openclaw-api',
+    configureServer(server) {
+      server.middlewares.use('/api', async (req, res) => {
+        const url = new URL(req.url ?? '/', `http://${req.headers.host}`);
+        const path = url.pathname;
+
+        try {
+          let data: unknown;
+
+          if (path === '/status') {
+            data = await readStatus();
+          } else if (path === '/sessions') {
+            data = await readSessions();
+          } else if (path === '/cron') {
+            data = { jobs: await readCronJobs() };
+          } else if (path === '/cron/runs') {
+            data = { runs: await readCronRuns() };
+          } else if (path === '/plugins') {
+            data = await readPlugins();
+          } else if (path === '/config') {
+            data = await readConfig();
+          } else if (path === '/logs') {
+            data = await readLogs();
+          } else if (path === '/skills') {
+            data = await readSkills();
+
+          // ─── Extensions (filesystem scan) ───
+          } else if (path === '/extensions') {
+            const extensions: Array<{ name: string; description: string; type: string; path: string }> = [];
+            try {
+              const extEntries = await readdir(EXT_DIR, { withFileTypes: true });
+              for (const entry of extEntries) {
+                if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
+                const extPath = join(EXT_DIR, entry.name);
+                const skillMd = await readFileSafe(join(extPath, 'SKILL.md'), 3000);
+                let description = '';
+                if (skillMd.exists) {
+                  const lines = skillMd.preview.split('\n').filter(l => l.trim() && !l.startsWith('#') && !l.startsWith('---'));
+                  description = lines[0]?.trim().slice(0, 200) || '';
+                }
+                extensions.push({ name: entry.name, description, type: 'extension', path: extPath });
+              }
+            } catch {}
+            data = { extensions };
+
+          // ─── Memory endpoints ───
+          } else if (path === '/memory/files') {
+            try {
+              const memDir = await getMemoryDir();
+              const entries = await readdir(memDir);
+              const mdFiles = entries.filter((f) => f.endsWith('.md'));
+              const files = await Promise.all(
+                mdFiles.map(async (name) => {
+                  const s = await stat(join(memDir, name));
+                  return { name, size: s.size, modified: s.mtime.toISOString() };
+                }),
+              );
+              data = { files, count: files.length };
+            } catch {
+              data = { files: [], count: 0 };
+            }
+          } else if (path === '/memory/vector-count') {
+            const result = await sqlite3('SELECT COUNT(*) FROM embeddings;');
+            data = { count: parseInt(result, 10) || 0 };
+          } else if (path === '/memory/architecture') {
+            const memDir = await getMemoryDir();
+            const [
+              rootFiles, rootCount, archiveCount, dreamingCount,
+              dreamingDeepCount, dreamingRemCount, dreamingLightCount,
+              snapshotCount, archiveTotalSize, dreamingTotalSize,
+              memoryDirTotalSize, dbSize,
+            ] = await Promise.all([
+              readdir(memDir).then((e) => e.filter((f) => f.endsWith('.md'))).catch(() => []),
+              fileCount(memDir, '.md').catch(() => 0),
+              fileCount(join(memDir, 'archive'), '.md').catch(() => 0),
+              fileCount(join(memDir, 'dreaming'), '.md').catch(() => 0),
+              fileCount(join(memDir, 'dreaming/deep'), '.md').catch(() => 0),
+              fileCount(join(memDir, 'dreaming/rem'), '.md').catch(() => 0),
+              fileCount(join(memDir, 'dreaming/light'), '.md').catch(() => 0),
+              fileCount(join(memDir, 'snapshots'), '.md').catch(() => 0),
+              dirSize(join(memDir, 'archive')).catch(() => 0),
+              dirSize(join(memDir, 'dreaming')).catch(() => 0),
+              dirSize(memDir).catch(() => 0),
+              stat(CHROMA_DB).then((s) => s.size).catch(() => 0),
+            ]);
+            let archiveMonths: string[] = [];
+            try {
+              const ae = await readdir(join(memDir, 'archive'), { withFileTypes: true });
+              archiveMonths = ae.filter((e) => e.isDirectory() && /^\d{4}-\d{2}$/.test(e.name)).map((e) => e.name);
+            } catch {}
+            let dreamingDirs: string[] = [];
+            try {
+              const de = await readdir(join(memDir, 'dreaming'), { withFileTypes: true });
+              dreamingDirs = de.filter((e) => e.isDirectory()).map((e) => e.name);
+            } catch {}
+            data = {
+              totalFiles: rootCount, rootFileCount: rootFiles.length,
+              archiveFileCount: archiveCount, archiveMonths, archiveTotalSize,
+              dreamingFileCount: dreamingCount, dreamingDeepCount, dreamingRemCount,
+              dreamingLightCount, dreamingDirs, dreamingTotalSize,
+              snapshotFileCount: snapshotCount, memoryDirTotalSize, chromaDbSize: dbSize,
+            };
+          } else if (path === '/memory/vector-breakdown') {
+            let categories: Array<{ category: string; count: number }> = [];
+            let sources: Array<{ source: string; count: number }> = [];
+            let totalEmbeddings = 0;
+            totalEmbeddings = parseInt(await sqlite3('SELECT COUNT(*) FROM embeddings;'), 10) || 0;
+            const catRows = await sqlite3("SELECT string_value, COUNT(*) FROM embedding_metadata WHERE key='category' GROUP BY string_value ORDER BY COUNT(*) DESC;");
+            categories = catRows.split('\n').filter(Boolean).map((row) => {
+              const [cat, cnt] = row.split('|');
+              return { category: cat || '(未分类)', count: parseInt(cnt, 10) || 0 };
+            });
+            const srcRows = await sqlite3("SELECT string_value, COUNT(*) FROM embedding_metadata WHERE key='source' GROUP BY string_value ORDER BY COUNT(*) DESC LIMIT 20;");
+            sources = srcRows.split('\n').filter(Boolean).map((row) => {
+              const [src, cnt] = row.split('|');
+              return { source: src || '(未知)', count: parseInt(cnt, 10) || 0 };
+            });
+            data = { totalEmbeddings, categories, sources };
+          } else if (path === '/memory/workspace') {
+            const wsDir = await getWorkspace();
+            const learnDir = await getLearningsDir();
+            const [memoryMd, soulMd, sessionState] = await Promise.all([
+              readFileSafe(join(wsDir, 'MEMORY.md')),
+              readFileSafe(join(wsDir, 'SOUL.md')),
+              readFileSafe(join(wsDir, 'SESSION-STATE.md')),
+            ]);
+            let learningsFiles: Array<{ name: string; size: number; modified: string }> = [];
+            try {
+              const entries = await readdir(learnDir);
+              const mdFiles = entries.filter((f) => f.endsWith('.md'));
+              learningsFiles = await Promise.all(
+                mdFiles.map(async (name) => {
+                  const s = await stat(join(learnDir, name));
+                  return { name, size: s.size, modified: s.mtime.toISOString() };
+                }),
+              );
+            } catch {}
+            let learningsTotalSize = 0;
+            try { learningsTotalSize = await dirSize(learnDir); } catch {}
+            data = {
+              files: { MEMORY: memoryMd, SOUL: soulMd, 'SESSION-STATE': sessionState },
+              learnings: { files: learningsFiles, totalCount: learningsFiles.length, totalSize: learningsTotalSize },
+            };
+          } else {
+            res.writeHead(404);
+            res.end('Not Found');
+            return;
+          }
+
+          res.writeHead(200, {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*',
+          });
+          res.end(JSON.stringify(data));
+        } catch (err) {
+          console.error(`[openclaw-api] ${path}:`, err);
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: err instanceof Error ? err.message : 'Unknown error' }));
+        }
+      });
+    },
+  };
+}
