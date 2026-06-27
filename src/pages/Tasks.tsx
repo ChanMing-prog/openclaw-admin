@@ -12,6 +12,7 @@ import {
   Play,
   Timer,
   AlertTriangle,
+  AlertCircle,
   History,
   MessageSquare,
 } from 'lucide-react';
@@ -155,6 +156,42 @@ function sessionTargetLabel(t?: string): string {
   return map[t ?? ''] ?? t ?? '-';
 }
 
+// ─── Cron health state machine ───
+type CronHealth = 'scheduled' | 'due' | 'late' | 'unknown' | 'disabled';
+
+const HEALTH_META: Record<CronHealth, { label: string; icon: LucideIcon; className: string; dotClass: string }> = {
+  scheduled: { label: '已排期', icon: CheckCircle2, className: 'cl-badge cl-badge-success', dotClass: 'bg-status-success' },
+  due: { label: '到期', icon: Clock, className: 'cl-badge cl-badge-warning', dotClass: 'bg-status-warning' },
+  late: { label: '迟到', icon: AlertTriangle, className: 'cl-badge cl-badge-error', dotClass: 'bg-status-error' },
+  unknown: { label: '未知', icon: AlertCircle, className: 'cl-badge', dotClass: 'bg-cl-text-muted' },
+  disabled: { label: '已禁用', icon: AlertCircle, className: 'cl-badge', dotClass: 'bg-cl-text-muted' },
+};
+
+function computeHealth(job: CronJob): CronHealth {
+  if (!job.enabled) return 'disabled';
+  const nextMs = job.state?.nextRunAtMs ?? 0;
+  if (!nextMs || nextMs <= 0) return 'unknown';
+  const now = Date.now();
+  const lagMs = nextMs - now;
+  if (lagMs > 0) return 'scheduled';
+  if (lagMs >= -5 * 60_000) return 'due';
+  return 'late';
+}
+
+// health sort priority: late > due > unknown > scheduled > disabled
+const HEALTH_SORT: Record<CronHealth, number> = { late: 0, due: 1, unknown: 2, scheduled: 3, disabled: 4 };
+
+function HealthBadge({ health }: { health: CronHealth }) {
+  const meta = HEALTH_META[health];
+  const Icon = meta.icon;
+  return (
+    <span className={meta.className}>
+      <Icon size={10} />
+      {meta.label}
+    </span>
+  );
+}
+
 // ─── components ───
 
 function StatCard({ icon: Icon, label, value, sub, variant = 'brand' }: {
@@ -228,6 +265,7 @@ function JobCard({ job, runs, expanded, onToggle }: {
   );
   const payload = job.payload?.message ?? '';
   const hasError = job.state?.lastRunStatus && job.state.lastRunStatus !== 'ok';
+  const health = computeHealth(job);
 
   return (
     <div className="cl-card animate-slide-up overflow-hidden">
@@ -235,15 +273,11 @@ function JobCard({ job, runs, expanded, onToggle }: {
         onClick={onToggle}
         className="w-full flex items-center gap-3 p-4 text-left hover:bg-surface-hover transition-colors"
       >
-        <div className={`w-2 h-2 rounded-full shrink-0 ${job.enabled ? 'bg-status-success' : 'bg-cl-text-tertiary'}`} />
+        <div className={`w-2 h-2 rounded-full shrink-0 ${HEALTH_META[health].dotClass}`} />
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 flex-wrap">
             <p className="label-large text-cl-text-primary truncate">{job.name || job.id}</p>
-            {job.enabled ? (
-              <span className="cl-badge cl-badge-success">启用</span>
-            ) : (
-              <span className="cl-badge" style={{ backgroundColor: 'var(--cl-bg-tertiary)', color: 'var(--cl-text-muted)' }}>禁用</span>
-            )}
+            <HealthBadge health={health} />
             {hasError && (
               <span className="cl-badge cl-badge-error">
                 <AlertTriangle size={10} />
@@ -449,7 +483,6 @@ export default function Tasks() {
 
   // ─── stats ───
   const enabledCount = jobs.filter((j) => j.enabled).length;
-  const errorJobs = jobs.filter((j) => j.state?.lastRunStatus && j.state.lastRunStatus !== 'ok').length;
   const okRuns = runs.filter((r) => r.status === 'ok' || r.status === 'succeeded').length;
   const successRate = runs.length > 0 ? Math.round((okRuns / runs.length) * 100) : 0;
   const jobNameMap = useMemo(() => {
@@ -458,17 +491,27 @@ export default function Tasks() {
     return m;
   }, [jobs]);
 
-  // ─── filter ───
+  // health distribution
+  const healthDist = useMemo(() => {
+    const dist: Record<CronHealth, number> = { scheduled: 0, due: 0, late: 0, unknown: 0, disabled: 0 };
+    for (const j of jobs) dist[computeHealth(j)]++;
+    return dist;
+  }, [jobs]);
+  const lateCount = healthDist.late;
+
+  // ─── filter + sort by health ───
   const filteredJobs = useMemo(() => {
-    return jobs.filter((j) => {
-      const matchSearch = search === '' || j.name.toLowerCase().includes(search.toLowerCase());
-      const matchFilter =
-        filter === 'all' ||
-        (filter === 'enabled' && j.enabled) ||
-        (filter === 'disabled' && !j.enabled) ||
-        (filter === 'error' && j.state?.lastRunStatus && j.state.lastRunStatus !== 'ok');
-      return matchSearch && matchFilter;
-    });
+    return jobs
+      .filter((j) => {
+        const matchSearch = search === '' || j.name.toLowerCase().includes(search.toLowerCase());
+        const matchFilter =
+          filter === 'all' ||
+          (filter === 'enabled' && j.enabled) ||
+          (filter === 'disabled' && !j.enabled) ||
+          (filter === 'error' && j.state?.lastRunStatus && j.state.lastRunStatus !== 'ok');
+        return matchSearch && matchFilter;
+      })
+      .sort((a, b) => HEALTH_SORT[computeHealth(a)] - HEALTH_SORT[computeHealth(b)]);
   }, [jobs, search, filter]);
 
   const filteredRuns = useMemo(() => {
@@ -535,7 +578,13 @@ export default function Tasks() {
         <StatCard icon={Clock} label="任务总数" value={jobs.length} sub={`${enabledCount} 启用 · ${jobs.length - enabledCount} 禁用`} variant="brand" />
         <StatCard icon={Play} label="执行次数" value={runs.length} sub={`最近 ${relativeTime(runs[0]?.ts ?? 0)}`} variant="neutral" />
         <StatCard icon={CheckCircle2} label="成功率" value={`${successRate}%`} sub={`${okRuns} 成功 · ${runs.length - okRuns} 失败`} variant={successRate >= 90 ? 'success' : 'warning'} />
-        <StatCard icon={AlertTriangle} label="异常任务" value={errorJobs} sub={errorJobs > 0 ? '需关注' : '全部正常'} variant={errorJobs > 0 ? 'error' : 'success'} />
+        <StatCard
+          icon={lateCount > 0 ? AlertTriangle : CheckCircle2}
+          label="健康分布"
+          value={lateCount > 0 ? lateCount : '正常'}
+          sub={`${healthDist.scheduled} 排期 · ${healthDist.due} 到期 · ${healthDist.late} 迟到`}
+          variant={lateCount > 0 ? 'error' : healthDist.due > 0 ? 'warning' : 'success'}
+        />
       </div>
 
       {/* Search + Filter */}

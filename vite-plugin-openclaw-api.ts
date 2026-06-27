@@ -592,6 +592,508 @@ async function readStatus(): Promise<unknown> {
   };
 }
 
+// ─── Usage Cost (token/cost analytics from session logs) ───
+
+const USAGE_DAY_MS = 24 * 60 * 60 * 1000;
+const USAGE_LOOKBACK_DAYS = 62;
+const USAGE_CACHE_TTL_MS = 10_000;
+const USAGE_SCAN_CONCURRENCY = 8;
+
+interface UsageEvent {
+  timestamp: string;
+  day: string;
+  sessionId: string;
+  sessionKey?: string;
+  agentId: string;
+  model?: string;
+  provider: string;
+  tokens: number;
+  cost: number;
+}
+
+interface UsageBreakdownRow {
+  key: string;
+  label: string;
+  tokens: number;
+  estimatedCost: number;
+  requests: number;
+  sessions: number;
+}
+
+interface UsagePeriod {
+  key: 'today' | '7d' | '30d';
+  label: string;
+  tokens: number;
+  estimatedCost: number;
+  requests: number;
+  pace: { label: string; state: 'rising' | 'steady' | 'cooling' | 'unknown' };
+}
+
+interface UsageCostData {
+  generatedAt: string;
+  periods: UsagePeriod[];
+  breakdown: {
+    byAgent: UsageBreakdownRow[];
+    byModel: UsageBreakdownRow[];
+    byProvider: UsageBreakdownRow[];
+    bySessionType: UsageBreakdownRow[];
+    byCronJob: UsageBreakdownRow[];
+  };
+  totalEvents: number;
+  sourceConnected: boolean;
+}
+
+let usageCache: { value: UsageCostData; expiresAt: number } | undefined;
+
+// 加载所有 agent 的 sessions.json，建立 sessionId → {sessionKey, agentId, model} 索引
+async function loadSessionsIndex(): Promise<Map<string, { sessionKey: string; agentId: string; model?: string }>> {
+  const out = new Map<string, { sessionKey: string; agentId: string; model?: string }>();
+  try {
+    const entries = await readdir(AGENTS_DIR, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const agentId = entry.name;
+      const sessionsJson = await readJsonFile<Record<string, unknown>>(
+        join(AGENTS_DIR, agentId, 'sessions/sessions.json'),
+      );
+      if (!sessionsJson) continue;
+      for (const [sessionKey, val] of Object.entries(sessionsJson)) {
+        const r = val as Record<string, unknown>;
+        const sessionId = String(r.sessionId ?? '');
+        if (sessionId) out.set(sessionId, { sessionKey, agentId, model: r.model ? String(r.model) : undefined });
+      }
+    }
+  } catch {}
+  return out;
+}
+
+function inferProvider(model?: string): string {
+  if (!model) return 'Unknown';
+  const n = model.toLowerCase();
+  if (n.includes('gpt') || n.includes('o1') || n.includes('o3') || n.includes('o4')) return 'OpenAI';
+  if (n.includes('claude')) return 'Anthropic';
+  if (n.includes('gemini')) return 'Google';
+  if (n.includes('deepseek')) return 'DeepSeek';
+  if (n.includes('minimax')) return 'MiniMax';
+  if (n.includes('sensenova')) return 'SenseNova';
+  if (n.includes('mimo')) return 'Xiaomi';
+  if (n.includes('qwen') || n.includes('llama') || n.includes('mistral')) return 'OSS/Other';
+  return 'Unknown';
+}
+
+function classifySessionType(sessionKey?: string): 'Cron' | 'Discord' | 'Telegram' | 'Main' {
+  const k = (sessionKey ?? '').toLowerCase();
+  if (k.includes(':cron:') || k.startsWith('cron:')) return 'Cron';
+  if (k.includes(':discord:') || k.startsWith('discord:')) return 'Discord';
+  if (k.includes(':telegram:') || k.startsWith('telegram:')) return 'Telegram';
+  return 'Main';
+}
+
+function parseCronJobIdFromSessionKey(sessionKey?: string): string | undefined {
+  const parts = (sessionKey ?? '').split(':').map((s) => s.trim()).filter(Boolean);
+  const i = parts.findIndex((p) => p.toLowerCase() === 'cron');
+  const id = parts[i + 1];
+  return id && id.trim() ? id.trim() : undefined;
+}
+
+// 扫描所有 agent 的 sessions/*.jsonl，解析 assistant message 的 usage 字段
+async function scanUsageEvents(): Promise<UsageEvent[]> {
+  const sessionIndex = await loadSessionsIndex();
+  const lowerBoundMs = Date.now() - (USAGE_LOOKBACK_DAYS - 1) * USAGE_DAY_MS;
+
+  const agentDirs: Array<{ agentId: string; sessionsDir: string }> = [];
+  try {
+    const entries = await readdir(AGENTS_DIR, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.isDirectory()) agentDirs.push({ agentId: entry.name, sessionsDir: join(AGENTS_DIR, entry.name, 'sessions') });
+    }
+  } catch {
+    return [];
+  }
+
+  // 收集候选文件（按 mtime 过滤）
+  const files: Array<{ path: string; agentId: string; sessionId: string }> = [];
+  for (const { sessionsDir, agentId } of agentDirs) {
+    try {
+      const entries = await readdir(sessionsDir);
+      for (const name of entries) {
+        if (!name.endsWith('.jsonl') || name.endsWith('.trajectory.jsonl')) continue;
+        const full = join(sessionsDir, name);
+        const s = await stat(full);
+        if (s.mtimeMs < lowerBoundMs) continue;
+        files.push({ path: full, agentId, sessionId: name.slice(0, -'.jsonl'.length) });
+      }
+    } catch {}
+  }
+
+  // 并发扫描
+  const events: UsageEvent[] = [];
+  let nextIdx = 0;
+  async function worker() {
+    while (nextIdx < files.length) {
+      const f = files[nextIdx++];
+      try {
+        const raw = await readFile(f.path, 'utf8');
+        const lines = raw.replace(/\r/g, '').split('\n');
+        for (const line of lines) {
+          const t = line.trim();
+          if (!t) continue;
+          let parsed: Record<string, unknown>;
+          try {
+            parsed = JSON.parse(t) as Record<string, unknown>;
+          } catch {
+            continue;
+          }
+          if (parsed.type !== 'message') continue;
+          const msg = parsed.message as Record<string, unknown> | undefined;
+          if (!msg || msg.role !== 'assistant') continue;
+          const usage = msg.usage as Record<string, unknown> | undefined;
+          if (!usage) continue;
+          const ts = String(parsed.timestamp ?? msg.timestamp ?? '');
+          const tsMs = ts ? Date.parse(ts) : NaN;
+          if (!Number.isFinite(tsMs) || tsMs < lowerBoundMs) continue;
+          const ctx = sessionIndex.get(f.sessionId);
+          const model = String(msg.model ?? ctx?.model ?? '');
+          const provider = inferProvider(model);
+          const tokens = Number(
+            usage.totalTokens ??
+              Number(usage.input) + Number(usage.output) + Number(usage.cacheRead) + Number(usage.cacheWrite),
+          );
+          const costObj = usage.cost as Record<string, unknown> | undefined;
+          const cost = Number(costObj?.total ?? 0);
+          events.push({
+            timestamp: new Date(tsMs).toISOString(),
+            day: new Date(tsMs).toISOString().slice(0, 10),
+            sessionId: f.sessionId,
+            sessionKey: ctx?.sessionKey,
+            agentId: ctx?.agentId ?? f.agentId,
+            model: model || undefined,
+            provider,
+            tokens: Math.max(0, tokens),
+            cost: Math.max(0, cost),
+          });
+        }
+      } catch {}
+    }
+  }
+  await Promise.all(
+    Array.from({ length: Math.min(USAGE_SCAN_CONCURRENCY, Math.max(1, files.length)) }, worker),
+  );
+  return events;
+}
+
+function classifyUsagePace(current: number, baseline?: number): UsagePeriod['pace'] {
+  if (baseline === undefined || baseline <= 0) return { label: '无基线', state: 'unknown' };
+  const r = current / baseline;
+  if (r >= 1.2) return { label: '上升', state: 'rising' };
+  if (r <= 0.8) return { label: '下降', state: 'cooling' };
+  return { label: '平稳', state: 'steady' };
+}
+
+async function readUsageCost(): Promise<UsageCostData> {
+  if (usageCache && usageCache.expiresAt > Date.now()) return usageCache.value;
+
+  const events = await scanUsageEvents();
+  const todayIso = new Date().toISOString().slice(0, 10);
+  const todayMs = Date.parse(`${todayIso}T00:00:00.000Z`);
+
+  function windowEvents(days: number): UsageEvent[] {
+    const lb = todayMs - (days - 1) * USAGE_DAY_MS;
+    return events.filter((e) => {
+      const m = Date.parse(e.day);
+      return Number.isFinite(m) && m >= lb && m <= todayMs;
+    });
+  }
+  function agg(evs: UsageEvent[]) {
+    let tokens = 0;
+    let cost = 0;
+    const sessions = new Set<string>();
+    for (const e of evs) {
+      tokens += e.tokens;
+      cost += e.cost;
+      sessions.add(e.sessionKey ?? e.sessionId);
+    }
+    return { tokens, cost, requests: evs.length, sessions: sessions.size };
+  }
+  function prevDailyAvgCost(days: number): number | undefined {
+    const curLower = todayMs - (days - 1) * USAGE_DAY_MS;
+    const prevUpper = curLower - USAGE_DAY_MS;
+    const prevLower = prevUpper - (days - 1) * USAGE_DAY_MS;
+    const prev = events.filter((e) => {
+      const m = Date.parse(e.day);
+      return m >= prevLower && m <= prevUpper;
+    });
+    if (prev.length === 0) return undefined;
+    return agg(prev).cost / Math.max(1, days);
+  }
+
+  const windows = [
+    { key: 'today' as const, days: 1, label: '今日' },
+    { key: '7d' as const, days: 7, label: '近 7 天' },
+    { key: '30d' as const, days: 30, label: '近 30 天' },
+  ];
+  const periods: UsagePeriod[] = windows.map((w) => {
+    const evs = windowEvents(w.days);
+    const a = agg(evs);
+    const curAvg = a.cost / Math.max(1, w.days);
+    return {
+      key: w.key,
+      label: w.label,
+      tokens: a.tokens,
+      estimatedCost: a.cost,
+      requests: a.requests,
+      pace: classifyUsagePace(curAvg, prevDailyAvgCost(w.days)),
+    };
+  });
+
+  function breakdown(
+    evs: UsageEvent[],
+    keyFn: (e: UsageEvent) => string,
+    limit = 12,
+  ): UsageBreakdownRow[] {
+    const m = new Map<string, UsageBreakdownRow>();
+    const sess = new Map<string, Set<string>>();
+    for (const e of evs) {
+      const k = (keyFn(e) || 'Unknown').trim();
+      const r =
+        m.get(k) ?? { key: k, label: k, tokens: 0, estimatedCost: 0, requests: 0, sessions: 0 };
+      r.tokens += e.tokens;
+      r.estimatedCost += e.cost;
+      r.requests += 1;
+      const s = sess.get(k) ?? new Set<string>();
+      s.add(e.sessionKey ?? e.sessionId);
+      sess.set(k, s);
+      r.sessions = s.size;
+      m.set(k, r);
+    }
+    return [...m.values()].sort((a, b) => b.tokens - a.tokens).slice(0, limit);
+  }
+
+  const ev30 = windowEvents(30);
+  const byAgent = breakdown(ev30, (e) => e.agentId);
+  const byModel = breakdown(ev30, (e) => e.model ?? '未报告');
+  const byProvider = breakdown(ev30, (e) => e.provider);
+  const bySessionType = breakdown(ev30, (e) => classifySessionType(e.sessionKey));
+
+  // cron 任务名映射
+  const cronNameMap = new Map<string, string>();
+  try {
+    const jobs = (await readCronJobs()) as Array<{ id: string; name: string }>;
+    for (const j of jobs) cronNameMap.set(j.id, j.name);
+  } catch {}
+  const byCronJob = breakdown(
+    ev30.filter((e) => classifySessionType(e.sessionKey) === 'Cron'),
+    (e) => {
+      const id = parseCronJobIdFromSessionKey(e.sessionKey);
+      return id ? cronNameMap.get(id) ?? id : '未识别 Cron';
+    },
+    24,
+  );
+
+  const result: UsageCostData = {
+    generatedAt: new Date().toISOString(),
+    periods,
+    breakdown: { byAgent, byModel, byProvider, bySessionType, byCronJob },
+    totalEvents: events.length,
+    sourceConnected: events.length > 0,
+  };
+  usageCache = { value: result, expiresAt: Date.now() + USAGE_CACHE_TTL_MS };
+  return result;
+}
+
+// ─── Connector Status (数据源连接健康度) ───
+
+interface ConnectorItem {
+  key: string;
+  label: string;
+  status: 'connected' | 'partial' | 'not_connected';
+  path: string;
+  detail: string;
+  hint?: string;
+}
+
+async function checkFileExists(path: string): Promise<boolean> {
+  try {
+    await stat(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function checkDirHasFiles(path: string): Promise<{ exists: boolean; count: number }> {
+  try {
+    const entries = await readdir(path, { withFileTypes: true });
+    const count = entries.filter((e) => !e.name.startsWith('.')).length;
+    return { exists: true, count };
+  } catch {
+    return { exists: false, count: 0 };
+  }
+}
+
+async function checkSqliteTable(db: string, table: string): Promise<{ exists: boolean; rows: number }> {
+  try {
+    const rows = await sqlite3Json(db, `SELECT COUNT(*) as c FROM ${table};`);
+    const count = Number((rows[0] as Record<string, unknown>)?.c ?? 0);
+    return { exists: true, rows: count };
+  } catch {
+    return { exists: false, rows: 0 };
+  }
+}
+
+async function readConnectors(): Promise<{ connectors: ConnectorItem[]; generatedAt: string }> {
+  const workspace = await getWorkspace();
+  const memoryDir = await getMemoryDir();
+
+  const items: ConnectorItem[] = [];
+
+  // 1. 会话索引
+  const sessionsPath = join(AGENTS_DIR, 'main/sessions/sessions.json');
+  const sessionsExists = await checkFileExists(sessionsPath);
+  items.push({
+    key: 'sessions',
+    label: '会话索引',
+    status: sessionsExists ? 'connected' : 'not_connected',
+    path: sessionsPath,
+    detail: sessionsExists ? '已连接' : 'sessions.json 不存在',
+    hint: sessionsExists ? undefined : 'OpenClaw 需运行至少一次以生成会话数据',
+  });
+
+  // 2. Cron 任务表
+  const cronCheck = await checkSqliteTable(OC_STATE_DB, 'cron_jobs');
+  items.push({
+    key: 'cron_jobs',
+    label: 'Cron 任务',
+    status: cronCheck.exists ? (cronCheck.rows > 0 ? 'connected' : 'partial') : 'not_connected',
+    path: OC_STATE_DB,
+    detail: cronCheck.exists ? `${cronCheck.rows} 个任务` : 'cron_jobs 表不存在',
+    hint: cronCheck.exists ? undefined : 'state/openclaw.sqlite 缺失或表未创建',
+  });
+
+  // 3. 执行记录表
+  const runsCheck = await checkSqliteTable(OC_STATE_DB, 'cron_run_logs');
+  items.push({
+    key: 'cron_runs',
+    label: '执行记录',
+    status: runsCheck.exists ? (runsCheck.rows > 0 ? 'connected' : 'partial') : 'not_connected',
+    path: OC_STATE_DB,
+    detail: runsCheck.exists ? `${runsCheck.rows} 条记录` : 'cron_run_logs 表不存在',
+    hint: runsCheck.exists ? undefined : 'OpenClaw 运行 Cron 后才会生成执行记录',
+  });
+
+  // 4. 记忆文件
+  const memCheck = await checkDirHasFiles(memoryDir);
+  items.push({
+    key: 'memory_files',
+    label: '记忆文件',
+    status: memCheck.exists ? (memCheck.count > 0 ? 'connected' : 'partial') : 'not_connected',
+    path: memoryDir,
+    detail: memCheck.exists ? `${memCheck.count} 个文件` : 'memory 目录不存在',
+    hint: memCheck.exists ? undefined : 'workspace 路径可能配置错误',
+  });
+
+  // 5. 向量库
+  const chromaExists = await checkFileExists(CHROMA_DB);
+  items.push({
+    key: 'vector_db',
+    label: '向量库',
+    status: chromaExists ? 'connected' : 'not_connected',
+    path: CHROMA_DB,
+    detail: chromaExists ? '已连接' : 'chroma.sqlite3 不存在',
+    hint: chromaExists ? undefined : 'memory-core 插件未运行或未初始化',
+  });
+
+  // 6. 技能
+  const skillsCheck = await checkDirHasFiles(SKILLS_DIR);
+  items.push({
+    key: 'skills',
+    label: '技能',
+    status: skillsCheck.exists ? (skillsCheck.count > 0 ? 'connected' : 'partial') : 'not_connected',
+    path: SKILLS_DIR,
+    detail: skillsCheck.exists ? `${skillsCheck.count} 个技能` : 'skills 目录不存在',
+  });
+
+  // 7. 扩展
+  const extCheck = await checkDirHasFiles(EXT_DIR);
+  items.push({
+    key: 'extensions',
+    label: '扩展',
+    status: extCheck.exists ? (extCheck.count > 0 ? 'connected' : 'partial') : 'not_connected',
+    path: EXT_DIR,
+    detail: extCheck.exists ? `${extCheck.count} 个扩展` : 'extensions 目录不存在',
+  });
+
+  // 8. 系统配置
+  const configPath = join(OC_HOME, 'openclaw.json');
+  const configExists = await checkFileExists(configPath);
+  items.push({
+    key: 'config',
+    label: '系统配置',
+    status: configExists ? 'connected' : 'not_connected',
+    path: configPath,
+    detail: configExists ? '已连接' : 'openclaw.json 不存在',
+    hint: configExists ? undefined : 'OPENCLAW_HOME 可能配置错误',
+  });
+
+  // 9. 内部日志
+  const logsCheck = await checkDirHasFiles(LOGS_DIR);
+  items.push({
+    key: 'logs_internal',
+    label: '内部日志',
+    status: logsCheck.exists ? (logsCheck.count > 0 ? 'connected' : 'partial') : 'not_connected',
+    path: LOGS_DIR,
+    detail: logsCheck.exists ? `${logsCheck.count} 个文件` : 'logs 目录不存在',
+  });
+
+  // 10. 网关日志
+  const gatewayLogPath = join(SYS_LOGS_DIR, 'gateway.log');
+  const gatewayExists = await checkFileExists(gatewayLogPath);
+  items.push({
+    key: 'logs_gateway',
+    label: '网关日志',
+    status: gatewayExists ? 'connected' : 'not_connected',
+    path: gatewayLogPath,
+    detail: gatewayExists ? '已连接' : 'gateway.log 不存在',
+    hint: gatewayExists ? undefined : 'OpenClaw 网关未运行或 launchd 未配置重定向',
+  });
+
+  // 11. 用量数据（直接检查 sessions/*.jsonl 是否存在且有 usage 字段）
+  let usageCount = 0;
+  let usageSampleFound = false;
+  const sampledFiles = new Set<string>();
+  try {
+    const agentEntries = await readdir(AGENTS_DIR, { withFileTypes: true });
+    for (const entry of agentEntries) {
+      if (!entry.isDirectory()) continue;
+      const sessionsDir = join(AGENTS_DIR, entry.name, 'sessions');
+      try {
+        const files = await readdir(sessionsDir);
+        for (const name of files) {
+          if (!name.endsWith('.jsonl') || name.endsWith('.trajectory.jsonl')) continue;
+          usageCount++;
+          // 只对前 3 个文件采样检查 usage 字段，找到即停止
+          if (!usageSampleFound && sampledFiles.size < 3) {
+            const full = join(sessionsDir, name);
+            sampledFiles.add(full);
+            const content = await readFile(full, 'utf8').catch(() => '');
+            if (content.slice(0, 8000).includes('"usage"')) usageSampleFound = true;
+          }
+        }
+      } catch {}
+    }
+  } catch {}
+  items.push({
+    key: 'usage_events',
+    label: '用量数据',
+    status: usageSampleFound ? 'connected' : usageCount > 0 ? 'partial' : 'not_connected',
+    path: join(AGENTS_DIR, '*/sessions/*.jsonl'),
+    detail: usageSampleFound ? `${usageCount} 个 session 文件` : usageCount > 0 ? `${usageCount} 文件但无 usage 字段` : '未找到 session 文件',
+    hint: usageSampleFound ? undefined : 'agents/*/sessions/*.jsonl 无 assistant message usage 字段',
+  });
+
+  return { connectors: items, generatedAt: new Date().toISOString() };
+}
+
 // ─── API Plugin ───
 
 export default function openclawApiPlugin(): Plugin {
@@ -621,6 +1123,10 @@ export default function openclawApiPlugin(): Plugin {
             data = await readLogs();
           } else if (path === '/skills') {
             data = await readSkills();
+          } else if (path === '/usage-cost') {
+            data = await readUsageCost();
+          } else if (path === '/connectors') {
+            data = await readConnectors();
 
           // ─── Extensions (filesystem scan) ───
           } else if (path === '/extensions') {

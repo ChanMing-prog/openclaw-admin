@@ -1,7 +1,16 @@
 import { useState, useEffect } from 'react';
-import { Bot, Puzzle, Clock, Server, ArrowUpRight, ArrowDownRight, RefreshCw } from 'lucide-react';
+import { Bot, Puzzle, Clock, Server, ArrowUpRight, ArrowDownRight, RefreshCw, Database, CheckCircle2, AlertCircle, XCircle } from 'lucide-react';
 import type { SystemStatus } from '@/types';
-import { fetchSystemStatus } from '@/lib/api';
+import { fetchSystemStatus, fetchJson } from '@/lib/api';
+
+interface ConnectorItem {
+  key: string;
+  label: string;
+  status: 'connected' | 'partial' | 'not_connected';
+  path: string;
+  detail: string;
+  hint?: string;
+}
 
 interface StatusCardProps {
   title: string;
@@ -61,6 +70,7 @@ function formatDuration(ms: number): string {
 
 export default function Dashboard() {
   const [status, setStatus] = useState<SystemStatus | null>(null);
+  const [connectors, setConnectors] = useState<ConnectorItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [lastRefresh, setLastRefresh] = useState(0);
@@ -69,8 +79,12 @@ export default function Dashboard() {
     try {
       setLoading(true);
       setError(null);
-      const data = await fetchSystemStatus();
+      const [data, connData] = await Promise.all([
+        fetchSystemStatus(),
+        fetchJson<{ connectors: ConnectorItem[] }>('/connectors').catch(() => ({ connectors: [] as ConnectorItem[] })),
+      ]);
       setStatus(data);
+      setConnectors(connData.connectors);
       setLastRefresh(Date.now());
     } catch (err) {
       setError(err instanceof Error ? err.message : '加载失败');
@@ -188,6 +202,44 @@ export default function Dashboard() {
           variant={status.tasks.failures > 0 ? 'warning' : 'brand'}
         />
       </div>
+
+      {/* Connector Status */}
+      {connectors.length > 0 && (
+        <div className="cl-card p-5 animate-slide-up">
+          <div className="flex items-center gap-2 mb-4">
+            <Database size={16} className="text-cl-text-muted" />
+            <h2 className="title-large text-cl-text-primary">数据源连接状态</h2>
+            <span className="label-small text-cl-text-muted ml-auto">
+              {connectors.filter((c) => c.status === 'connected').length}/{connectors.length} 已连接
+            </span>
+          </div>
+          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
+            {connectors.map((c) => {
+              const meta = {
+                connected: { icon: CheckCircle2, color: 'text-status-success', bg: 'bg-status-success/10' },
+                partial: { icon: AlertCircle, color: 'text-status-warning', bg: 'bg-status-warning/10' },
+                not_connected: { icon: XCircle, color: 'text-status-error', bg: 'bg-status-error/10' },
+              }[c.status];
+              const Icon = meta.icon;
+              return (
+                <div
+                  key={c.key}
+                  className="p-3 rounded-lg bg-bg-secondary border border-cl-border-faint"
+                  title={c.hint ?? c.path}
+                >
+                  <div className="flex items-center gap-2 mb-1">
+                    <div className={`p-1 rounded ${meta.bg}`}>
+                      <Icon size={12} className={meta.color} />
+                    </div>
+                    <span className="label-medium text-cl-text-primary truncate">{c.label}</span>
+                  </div>
+                  <p className={`label-small ${meta.color} truncate`}>{c.detail}</p>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       {/* Agent Details */}
       <div className="cl-card p-5 animate-slide-up">
