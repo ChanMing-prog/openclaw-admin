@@ -374,10 +374,6 @@ export default function Capabilities() {
     });
   }, [extensions, search]);
 
-  // ─── stats ───
-  const enabledPlugins = plugins.filter((p) => p.enabled).length;
-  const activeSkills = skills.filter((s) => s.eligible && !s.disabled).length;
-
   // ─── loading ───
   if (loading && plugins.length === 0 && skills.length === 0) {
     return (
@@ -441,7 +437,7 @@ export default function Capabilities() {
           </div>
           <div>
             <p className="label-small text-cl-text-muted">插件</p>
-            <p className="label-large text-cl-text-primary">{enabledPlugins}/{plugins.length}</p>
+            <p className="label-large text-cl-text-primary">{plugins.length}</p>
           </div>
         </div>
         <div className="flex items-center gap-2.5 px-3 py-2 rounded-lg bg-bg-secondary">
@@ -450,7 +446,7 @@ export default function Capabilities() {
           </div>
           <div>
             <p className="label-small text-cl-text-muted">技能</p>
-            <p className="label-large text-cl-text-primary">{activeSkills}/{skills.length}</p>
+            <p className="label-large text-cl-text-primary">{skills.length}</p>
           </div>
         </div>
         <div className="flex items-center gap-2.5 px-3 py-2 rounded-lg bg-bg-secondary">

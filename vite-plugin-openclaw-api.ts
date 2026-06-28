@@ -625,6 +625,34 @@ const USAGE_LOOKBACK_DAYS = 62;
 const USAGE_CACHE_TTL_MS = 10_000;
 const USAGE_SCAN_CONCURRENCY = 8;
 
+// 官方定价表（人民币 ¥/百万 tokens）
+// 对有定价的模型自己计算 cost（人民币）；无定价的回退到 OpenClaw 记录的美元 cost
+interface ModelPrice {
+  inputCached: number;   // 命中缓存的输入
+  inputUncached: number; // 未命中缓存的输入
+  output: number;
+}
+const MODEL_PRICES: Record<string, ModelPrice> = {
+  'mimo-v2.5': { inputCached: 0.02, inputUncached: 1.00, output: 2.00 },
+  'mimo-v2.5-pro': { inputCached: 0.025, inputUncached: 3.00, output: 6.00 },
+  // MiniMax-M3 上下文 ≤512K 档（实测全部请求均在此档）
+  'MiniMax-M3': { inputCached: 0.42, inputUncached: 2.10, output: 8.40 },
+};
+
+// 按官方定价计算人民币成本（元）；无定价返回 null（调用方回退到 OpenClaw 记录值）
+function computeCostCny(model: string, usage: Record<string, unknown>): number | null {
+  const price = MODEL_PRICES[model];
+  if (!price) return null;
+  const input = Number(usage.input ?? 0);
+  const output = Number(usage.output ?? 0);
+  const cacheRead = Number(usage.cacheRead ?? 0);
+  const inputUncached = Math.max(0, input - cacheRead);
+  // 单位：¥/M tokens，所以除以 1_000_000
+  const cost =
+    (inputUncached * price.inputUncached + cacheRead * price.inputCached + output * price.output) / 1_000_000;
+  return cost;
+}
+
 interface UsageEvent {
   timestamp: string;
   day: string;
@@ -635,6 +663,7 @@ interface UsageEvent {
   provider: string;
   tokens: number;
   cost: number;
+  currency: 'CNY' | 'USD'; // CNY=官方定价计算，USD=回退 OpenClaw 记录值
 }
 
 interface UsageBreakdownRow {
@@ -647,7 +676,7 @@ interface UsageBreakdownRow {
 }
 
 interface UsagePeriod {
-  key: 'today' | '7d' | '30d';
+  key: 'today' | 'yesterday' | '3d' | '7d' | '30d';
   label: string;
   tokens: number;
   estimatedCost: number;
@@ -786,7 +815,10 @@ async function scanUsageEvents(): Promise<UsageEvent[]> {
               Number(usage.input) + Number(usage.output) + Number(usage.cacheRead) + Number(usage.cacheWrite),
           );
           const costObj = usage.cost as Record<string, unknown> | undefined;
-          const cost = Number(costObj?.total ?? 0);
+          const ocCost = Number(costObj?.total ?? 0);
+          // 优先用官方定价算人民币成本；无定价回退 OpenClaw 记录的美元成本
+          const cnyCost = model ? computeCostCny(model, usage) : null;
+          const useOfficial = cnyCost !== null;
           events.push({
             timestamp: new Date(tsMs).toISOString(),
             day: new Date(tsMs).toISOString().slice(0, 10),
@@ -796,7 +828,8 @@ async function scanUsageEvents(): Promise<UsageEvent[]> {
             model: model || undefined,
             provider,
             tokens: Math.max(0, tokens),
-            cost: Math.max(0, cost),
+            cost: Math.max(0, useOfficial ? cnyCost! : ocCost),
+            currency: useOfficial ? 'CNY' : 'USD',
           });
         }
       } catch {}
@@ -830,13 +863,18 @@ async function readUsageCost(): Promise<UsageCostData> {
       return Number.isFinite(m) && m >= lb && m <= todayMs;
     });
   }
+  // 统一换算为人民币（USD 按 7.2 估算）
+  const USD_TO_CNY = 7.2;
+  function toCny(e: UsageEvent): number {
+    return e.currency === 'USD' ? e.cost * USD_TO_CNY : e.cost;
+  }
   function agg(evs: UsageEvent[]) {
     let tokens = 0;
     let cost = 0;
     const sessions = new Set<string>();
     for (const e of evs) {
       tokens += e.tokens;
-      cost += e.cost;
+      cost += toCny(e);
       sessions.add(e.sessionKey ?? e.sessionId);
     }
     return { tokens, cost, requests: evs.length, sessions: sessions.size };
@@ -855,11 +893,24 @@ async function readUsageCost(): Promise<UsageCostData> {
 
   const windows = [
     { key: 'today' as const, days: 1, label: '今日' },
-    { key: '7d' as const, days: 7, label: '近 7 天' },
-    { key: '30d' as const, days: 30, label: '近 30 天' },
+    { key: 'yesterday' as const, days: 1, label: '昨日', offset: 1 },
+    { key: '3d' as const, days: 3, label: '近 3 日' },
+    { key: '7d' as const, days: 7, label: '近 7 日' },
+    { key: '30d' as const, days: 30, label: '近 30 日' },
   ];
   const periods: UsagePeriod[] = windows.map((w) => {
-    const evs = windowEvents(w.days);
+    // 支持 offset（如昨日 = 从今天往前 offset 天的那一天）
+    let evs: UsageEvent[];
+    if ('offset' in w && typeof w.offset === 'number') {
+      const targetUpper = todayMs - w.offset * USAGE_DAY_MS;
+      const targetLower = targetUpper - (w.days - 1) * USAGE_DAY_MS;
+      evs = events.filter((e) => {
+        const m = Date.parse(e.day);
+        return Number.isFinite(m) && m >= targetLower && m <= targetUpper;
+      });
+    } else {
+      evs = windowEvents(w.days);
+    }
     const a = agg(evs);
     const curAvg = a.cost / Math.max(1, w.days);
     return {

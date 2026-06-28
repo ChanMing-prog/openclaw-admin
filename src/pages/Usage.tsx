@@ -6,7 +6,7 @@ import { fetchJson } from '@/lib/api';
 // ─── types ───
 
 interface UsagePeriod {
-  key: 'today' | '7d' | '30d';
+  key: 'today' | 'yesterday' | '3d' | '7d' | '30d';
   label: string;
   tokens: number;
   estimatedCost: number;
@@ -60,8 +60,9 @@ function formatNumber(n: number): string {
 }
 
 function formatCost(n: number): string {
-  if (n === 0) return '$0';
-  return `$${n.toFixed(4)}`;
+  if (n === 0) return '¥0';
+  if (n < 0.01) return `¥${n.toFixed(4)}`;
+  return `¥${n.toFixed(2)}`;
 }
 
 const PACE_META: Record<UsagePeriod['pace']['state'], { icon: LucideIcon; color: string }> = {
@@ -170,8 +171,8 @@ export default function Usage() {
     return (
       <div className="space-y-6 animate-fade-in">
         <div className="skeleton h-8 w-48 rounded-lg" />
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-3 stagger-children">
-          {[...Array(3)].map((_, i) => (
+        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-3 stagger-children">
+          {[...Array(5)].map((_, i) => (
             <div key={i} className="cl-card p-5 space-y-3">
               <div className="skeleton h-3 w-20 rounded-md" />
               <div className="skeleton h-7 w-24 rounded-md" />
@@ -219,7 +220,7 @@ export default function Usage() {
         <div>
           <h1 className="headline-large text-cl-text-primary">用量中心</h1>
           <p className="body-medium text-cl-text-muted mt-1">
-            Token 消耗与花费趋势 · 近 30 天 {formatNumber(data?.totalEvents ?? 0)} 条用量记录
+            Token 消耗与花费趋势 · 近 30 日 {formatNumber(data?.totalEvents ?? 0)} 条用量记录
           </p>
         </div>
         <button
@@ -233,7 +234,7 @@ export default function Usage() {
       </div>
 
       {/* Period cards */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-3 stagger-children">
+      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-3 stagger-children">
         {data?.periods.map((p) => (
           <PeriodCard key={p.key} period={p} />
         ))}
@@ -243,7 +244,7 @@ export default function Usage() {
       <div className="cl-card p-5">
         <div className="flex items-center gap-2 mb-4">
           <Zap size={16} className="text-cl-text-muted" />
-          <h2 className="title-medium text-cl-text-primary">维度拆分（近 30 天）</h2>
+          <h2 className="title-medium text-cl-text-primary">维度拆分（近 30 日）</h2>
         </div>
 
         {/* dimension tabs */}
