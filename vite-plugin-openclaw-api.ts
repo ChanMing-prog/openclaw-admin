@@ -6,9 +6,25 @@ import { join } from 'node:path';
 
 const execFileAsync = promisify(execFile);
 
+// 用户主目录：macOS/Linux 用 HOME，Windows 用 USERPROFILE
+const HOME = process.env.HOME ?? process.env.USERPROFILE ?? '~';
+
 // 支持环境变量覆盖 OpenClaw 主目录，默认 ~/.openclaw
-const HOME = process.env.HOME ?? '~';
 const OC_HOME = process.env.OPENCLAW_HOME ? String(process.env.OPENCLAW_HOME) : join(HOME, '.openclaw');
+
+// 系统日志目录：可被 OPENCLAW_SYS_LOGS_DIR 覆盖；否则按平台回退
+// macOS: ~/Library/Logs/openclaw（launchd 重定向目标）
+// Linux: ~/.local/state/openclaw/logs（systemd 用户级日志常见位置）
+// Windows: %LOCALAPPDATA%\openclaw\logs
+function resolveSysLogsDir(): string {
+  if (process.env.OPENCLAW_SYS_LOGS_DIR) return String(process.env.OPENCLAW_SYS_LOGS_DIR);
+  const platform = process.platform;
+  if (platform === 'darwin') return join(HOME, 'Library/Logs/openclaw');
+  if (platform === 'win32') return join(process.env.LOCALAPPDATA ?? join(HOME, 'AppData/Local'), 'openclaw/logs');
+  // Linux/其他：默认 ~/.local/state/openclaw/logs，也可用 XDG_STATE_HOME
+  const xdgState = process.env.XDG_STATE_HOME;
+  return xdgState ? join(xdgState, 'openclaw/logs') : join(HOME, '.local/state/openclaw/logs');
+}
 
 // 以下路径从 openclaw.json 动态读取（workspace 可配置），读不到则回退默认值
 let cachedConfig: Record<string, unknown> | null = null;
@@ -47,7 +63,7 @@ const SKILLS_DIR = join(OC_HOME, 'skills');
 const EXT_DIR = join(OC_HOME, 'extensions');
 const OC_STATE_DB = join(OC_HOME, 'state/openclaw.sqlite');
 const LOGS_DIR = join(OC_HOME, 'logs');
-const SYS_LOGS_DIR = join(HOME, 'Library/Logs/openclaw');
+const SYS_LOGS_DIR = resolveSysLogsDir();
 
 // ─── Filesystem helpers (no CLI needed) ───
 
@@ -1316,7 +1332,11 @@ async function readConnectors(): Promise<{ connectors: ConnectorItem[]; generate
     status: gatewayExists ? 'connected' : 'not_connected',
     path: gatewayLogPath,
     detail: gatewayExists ? '已连接' : 'gateway.log 不存在',
-    hint: gatewayExists ? undefined : 'OpenClaw 网关未运行或 launchd 未配置重定向',
+    hint: gatewayExists ? undefined : (process.platform === 'darwin'
+      ? 'OpenClaw 网关未运行或 launchd 未配置重定向'
+      : process.platform === 'win32'
+        ? 'OpenClaw 网关未运行或未配置日志重定向（检查 %OPENCLAW_SYS_LOGS_DIR%）'
+        : 'OpenClaw 网关未运行或 systemd 未配置重定向（检查 $OPENCLAW_SYS_LOGS_DIR）'),
   });
 
   // 11. 用量数据（直接检查 sessions/*.jsonl 是否存在且有 usage 字段）
