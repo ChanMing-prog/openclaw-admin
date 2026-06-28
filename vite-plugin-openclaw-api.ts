@@ -282,6 +282,126 @@ async function readLogTail(path: string, maxLines = 200): Promise<string[]> {
   }
 }
 
+// 错误日志专用读取：合并多行条目（时间戳/[component] 开头作为新条目）+ 去重同类警告
+async function readErrorLogTail(path: string, maxEntries = 100): Promise<string[]> {
+  try {
+    const content = await readFile(path, 'utf8');
+    const rawLines = content.split('\n');
+    return readErrorLogTailFromLines(rawLines, maxEntries);
+  } catch {
+    return [];
+  }
+}
+
+// 从已读取的行列表中合并多行 + 去重同类警告
+async function readErrorLogTailFromLines(rawLines: string[], maxEntries = 100): Promise<string[]> {
+  // 合并多行：以时间戳 ISO 或 [component] 开头的行视为新条目起始
+  const ISO_RE = /^\d{4}-\d{2}-\d{2}T/;
+  const COMP_RE = /^\[[a-zA-Z][a-zA-Z0-9_:]*\]/;
+  const entries: string[] = [];
+  let current = '';
+  for (const line of rawLines) {
+    if (!line.trim()) {
+      if (current) current += '\n';
+      continue;
+    }
+    if (ISO_RE.test(line) || COMP_RE.test(line)) {
+      if (current.trim()) entries.push(current.trim());
+      current = line;
+    } else {
+      // 续行：附加到当前条目（保留换行）
+      if (current) current += '\n' + line;
+      else current = line;
+    }
+  }
+  if (current.trim()) entries.push(current.trim());
+
+  // 取尾部
+  const tail = entries.slice(-maxEntries);
+
+  // 按消息模式去重：把动态部分（路径、ID、PID）替换为占位符后作为 key
+  // 已知重复模式：Skipping escaped skill path ... requested=<path>
+  const SKILL_RE = /(Skipping escaped skill path outside its configured root: source=\S+ root=\S+ reason=\S+) requested=(\S+) resolved=\S+/;
+  // Subagent orphan run pruned ... run=<id> child=<id> reason=<reason>
+  const ORPHAN_RE = /(Subagent orphan run pruned source=\S+) run=\S+ child=\S+ reason=\S+/;
+  const patternMap = new Map<string, { count: number; firstIdx: number; samples: string[]; firstEntry: string }>();
+  const deduped: string[] = [];
+  for (const entry of tail) {
+    let matched = false;
+    // 技能逃逸
+    const m1 = SKILL_RE.exec(entry);
+    if (m1) {
+      const skillName = m1[2].split('/').pop() ?? m1[2];
+      const pattern = entry.replace(SKILL_RE, '$1 requested=<*> resolved=<*>');
+      const existing = patternMap.get(pattern);
+      if (existing) {
+        existing.count += 1;
+        existing.samples.push(skillName);
+      } else {
+        patternMap.set(pattern, { count: 1, firstIdx: deduped.length, samples: [skillName], firstEntry: entry });
+        deduped.push('__PLACEHOLDER__');
+      }
+      matched = true;
+    }
+    // 孤儿子代理运行
+    if (!matched) {
+      const m2 = ORPHAN_RE.exec(entry);
+      if (m2) {
+        const pattern = entry.replace(ORPHAN_RE, '$1 run=<*> child=<*> reason=<*>');
+        const existing = patternMap.get(pattern);
+        if (existing) {
+          existing.count += 1;
+        } else {
+          patternMap.set(pattern, { count: 1, firstIdx: deduped.length, samples: [], firstEntry: entry });
+          deduped.push('__PLACEHOLDER__');
+        }
+        matched = true;
+      }
+    }
+    if (!matched) {
+      deduped.push(entry);
+    }
+  }
+  // 替换占位符为聚合后的条目
+  for (const [, info] of patternMap) {
+    if (info.count > 1) {
+      const samples = info.samples.filter(Boolean);
+      const sampleStr = samples.length > 0
+        ? `（涉及：${samples.slice(0, 10).join('、')}${samples.length > 10 ? ` 等 ${samples.length} 个` : ''}）`
+        : '';
+      deduped[info.firstIdx] = `⚠️ 相同模式警告 × ${info.count}${sampleStr}\n样本：${info.firstEntry}`;
+    } else {
+      deduped[info.firstIdx] = info.firstEntry;
+    }
+  }
+  return deduped;
+}
+
+// 从日志条目中提取 ISO 时间用于排序（支持单行和多行条目）
+// 旧格式：[2026-05-21T06:34:24Z] openclaw restart ...
+// 新格式：2026-06-28T11:03:50.260+08:00 [gateway] ...
+// 聚合格式：⚠️ 相同模式警告 × N\n样本：2026-05-16T15:00:00.165+08:00 ...
+// 多行错误：2026-05-16T10:00:00.151+08:00 [skills] ...\n续行...
+function extractRestartTime(line: string): string {
+  return extractLogTime(line);
+}
+
+function extractLogTime(entry: string): string {
+  // 优先匹配开头的 ISO 时间（新格式）
+  const m1 = /^(\d{4}-\d{2}-\d{2}T\S+)/.exec(entry);
+  if (m1) return m1[1];
+  // 旧格式：[ISO] ...
+  const m2 = /^\[([^\]]+)\]/.exec(entry);
+  if (m2) return m2[1];
+  // 聚合格式：⚠️ ... \n样本：ISO ...
+  const m3 = /样本：(2026-\d{2}-\d{2}T\S+)/.exec(entry);
+  if (m3) return m3[1];
+  // 聚合格式：⚠️ ... \n样本：[ISO] ...
+  const m4 = /样本：\[([^\]]+)\]/.exec(entry);
+  if (m4) return m4[1];
+  return '';
+}
+
 async function readLogs(): Promise<unknown> {
   // 1. 文件列表（合并 ~/.openclaw/logs 和 ~/Library/Logs/openclaw）
   const files: Array<{ name: string; size: number; modified: string; lines: number; location: string }> = [];
@@ -326,49 +446,114 @@ async function readLogs(): Promise<unknown> {
     .reverse();
 
   // 3. 网关日志尾部（优先读系统位置，回退到旧位置）— 倒序：最新在前
-  const gateway = ((await readLogTail(join(SYS_LOGS_DIR, 'gateway.log'), 200)).length > 0
-    ? await readLogTail(join(SYS_LOGS_DIR, 'gateway.log'), 200)
+  const sysGateway = await readLogTail(join(SYS_LOGS_DIR, 'gateway.log'), 400);
+  const gateway = (sysGateway.length > 0
+    ? sysGateway
     : await readLogTail(join(LOGS_DIR, 'gateway.log'), 150)).reverse();
 
-  // 4. 错误日志尾部（旧位置）— 倒序：最新在前
-  const errors = (await readLogTail(join(LOGS_DIR, 'gateway.err.log'), 150)).reverse();
+  // 4. 错误/警告日志 — 合并旧位置的历史 + 系统位置的新记录
+  //    旧位置 gateway.err.log：2026-03 ~ 2026-05-16（独立错误日志文件）
+  //    系统位置 gateway.log：2026-06-24 起（warn/error 混在网关日志中，用 [warn]/[error] 标记）
+  const legacyErrEntries = await readErrorLogTail(join(LOGS_DIR, 'gateway.err.log'), 80);
+  const newErrLines = sysGateway.filter((l) =>
+    /\[(warn|error)\]/i.test(l) || /\b(warn|error|fail|failed|fatal|crash)\b/i.test(l),
+  );
+  const newErrEntries = await readErrorLogTailFromLines(newErrLines, 80);
+  // 合并后按时间倒序
+  const allErrors = [...legacyErrEntries, ...newErrEntries];
+  allErrors.sort((a, b) => {
+    const ta = extractLogTime(a);
+    const tb = extractLogTime(b);
+    return tb.localeCompare(ta);
+  });
+  const errors = allErrors.slice(0, 100);
 
-  // 5. 重启日志 — 倒序：最新在前
-  const restarts = (await readLogTail(join(LOGS_DIR, 'gateway-restart.log'), 100)).reverse();
+  // 5. 重启日志 — 合并旧位置的历史记录 + 系统位置的新记录
+  //    旧位置 gateway-restart.log：2026-04 ~ 2026-06-02（[ISO] openclaw restart attempt/done ...）
+  //    系统位置 gateway.log：2026-06-24 起（[gateway] received SIGTERM; restarting ...）
+  const legacyRestarts = await readLogTail(join(LOGS_DIR, 'gateway-restart.log'), 100);
+  const newRestartLines = sysGateway.filter((l) =>
+    /received SIGTERM;\s*restarting/i.test(l) ||
+    /shutdown\] started:\s*gateway restarting/i.test(l) ||
+    /restart mode:/i.test(l) ||
+    /gateway tool:\s*restart requested/i.test(l) ||
+    /waiting for\s+\d+\s+pending reply/i.test(l),
+  );
+  // 合并后按时间倒序：两种格式都含 ISO 时间，直接字符串排序
+  const allRestarts = [...legacyRestarts, ...newRestartLines];
+  allRestarts.sort((a, b) => {
+    const ta = extractRestartTime(a);
+    const tb = extractRestartTime(b);
+    return tb.localeCompare(ta);
+  });
+  const restarts = allRestarts.slice(0, 100);
 
   // 6. 配置审计尾部（JSON Lines）
+  // 字段：{ts, source, event, configPath, pid, argv, previousHash, nextHash, previousBytes, nextBytes, result}
   const auditLines = await readLogTail(join(LOGS_DIR, 'config-audit.jsonl'), 100);
   const audit = auditLines
     .map((line) => {
       try {
         const obj = JSON.parse(line) as Record<string, unknown>;
+        const argv = Array.isArray(obj.argv) ? (obj.argv as string[]) : [];
+        const cmd = argv.length > 0 ? argv[argv.length - 1] : '';
+        const prevBytes = typeof obj.previousBytes === 'number' ? obj.previousBytes : null;
+        const nextBytes = typeof obj.nextBytes === 'number' ? obj.nextBytes : null;
+        const delta = prevBytes != null && nextBytes != null ? nextBytes - prevBytes : null;
         return {
-          timestamp: String(obj.timestamp ?? obj.ts ?? ''),
-          action: String(obj.action ?? obj.type ?? ''),
-          path: String(obj.path ?? obj.file ?? ''),
-          detail: line.slice(0, 200),
+          timestamp: String(obj.ts ?? obj.timestamp ?? ''),
+          event: String(obj.event ?? ''),
+          source: String(obj.source ?? ''),
+          command: cmd,
+          configPath: String(obj.configPath ?? ''),
+          result: String(obj.result ?? ''),
+          previousBytes: prevBytes,
+          nextBytes: nextBytes,
+          deltaBytes: delta,
+          hashChanged: obj.previousHash !== obj.nextHash,
+          detail: line,
         };
       } catch {
-        return { timestamp: '', action: '', path: '', detail: line.slice(0, 200) };
+        return {
+          timestamp: '', event: '', source: '', command: '', configPath: '',
+          result: '', previousBytes: null, nextBytes: null, deltaBytes: null,
+          hashChanged: false, detail: line.slice(0, 300),
+        };
       }
     })
     .reverse();
 
   // 7. 稳定性事件（stability 目录，JSON 文件）
-  const stability: Array<{ timestamp: string; event: string; detail: string }> = [];
+  // 字段：{version, generatedAt, reason, process, host, error, snapshot}
+  const stability: Array<{
+    timestamp: string;
+    reason: string;
+    errorMessage: string;
+    errorName: string;
+    pid: number;
+    node: string;
+    uptimeMs: number;
+    detail: string;
+  }> = [];
   try {
     const stabDir = join(LOGS_DIR, 'stability');
     const stabEntries = await readdir(stabDir, { withFileTypes: true });
     for (const entry of stabEntries) {
       if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
       const obj = await readJsonFile<Record<string, unknown>>(join(stabDir, entry.name));
-      if (obj) {
-        stability.push({
-          timestamp: String(obj.timestamp ?? obj.ts ?? entry.name.match(/\d{4}-\d{2}-\d{2}T[\d-]+Z/)?.[0] ?? ''),
-          event: String(obj.event ?? obj.type ?? 'stability'),
-          detail: JSON.stringify(obj).slice(0, 300),
-        });
-      }
+      if (!obj) continue;
+      const process = (obj.process ?? {}) as Record<string, unknown>;
+      const error = (obj.error ?? {}) as Record<string, unknown>;
+      stability.push({
+        timestamp: String(obj.generatedAt ?? ''),
+        reason: String(obj.reason ?? 'unknown'),
+        errorMessage: String(error.message ?? ''),
+        errorName: String(error.name ?? ''),
+        pid: Number(process.pid ?? 0),
+        node: String(process.node ?? ''),
+        uptimeMs: Number(process.uptimeMs ?? 0),
+        detail: JSON.stringify(obj).slice(0, 500),
+      });
     }
     stability.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
   } catch {}
