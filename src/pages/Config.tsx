@@ -230,7 +230,7 @@ export default function Config() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [search, setSearch] = useState('');
-  const [expandedKey, setExpandedKey] = useState<string | null>('models');
+  const [expandedKeys, setExpandedKeys] = useState<Set<string>>(new Set());
 
   const loadData = async () => {
     try {
@@ -335,21 +335,31 @@ export default function Config() {
       </div>
 
       {/* Sections */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+      <div className="space-y-3">
         {filteredSections.length === 0 ? (
-          <div className="cl-card p-8 text-center lg:col-span-2">
+          <div className="cl-card p-8 text-center">
             <p className="body-medium text-cl-text-muted">无匹配配置</p>
           </div>
         ) : (
-          filteredSections.map((s) => (
-            <SectionCard
-              key={s.key}
-              def={s}
-              data={config[s.key]}
-              expanded={expandedKey === s.key}
-              onToggle={() => setExpandedKey(expandedKey === s.key ? null : s.key)}
-            />
-          ))
+          filteredSections.map((s) => {
+            const isExpanded = expandedKeys.has(s.key);
+            return (
+              <SectionCard
+                key={s.key}
+                def={s}
+                data={config[s.key]}
+                expanded={isExpanded}
+                onToggle={() => {
+                  setExpandedKeys((prev) => {
+                    const next = new Set(prev);
+                    if (next.has(s.key)) next.delete(s.key);
+                    else next.add(s.key);
+                    return next;
+                  });
+                }}
+              />
+            );
+          })
         )}
       </div>
     </div>

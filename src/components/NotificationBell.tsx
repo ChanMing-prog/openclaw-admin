@@ -18,9 +18,13 @@ interface CronJob {
 
 interface CronRun {
   status?: string;
+  ts?: number;
+  runAtMs?: number;
   startedAtMs?: number;
+  jobId?: string;
   name?: string;
   error?: string;
+  summary?: string;
 }
 
 interface StabilityEvent {
@@ -96,6 +100,8 @@ export default function NotificationBell() {
       const notifs: NotificationItem[] = [];
 
       // 1. Cron 任务失败（最近 5 条失败记录）
+      const jobNameMap = new Map<string, string>();
+      for (const j of cronData.jobs) jobNameMap.set(j.id ?? '', j.name ?? j.id ?? '');
       const failedRuns = runsData.runs
         .filter((r) => {
           const st = String(r.status ?? '').toLowerCase();
@@ -103,13 +109,15 @@ export default function NotificationBell() {
         })
         .slice(0, 5);
       for (const r of failedRuns) {
+        const runMs = r.runAtMs ?? r.ts ?? r.startedAtMs ?? 0;
+        const jobName = (r.jobId && jobNameMap.get(r.jobId)) || r.name || r.jobId || '未知';
         notifs.push({
-          id: `cron-run-${r.startedAtMs}-${r.name}`,
+          id: `cron-run-${runMs}-${r.jobId ?? r.name}`,
           type: 'cron-fail',
           icon: AlertTriangle,
-          title: `任务失败：${r.name || '未知'}`,
-          desc: r.error?.slice(0, 100) || `状态：${r.status}`,
-          time: toMs(r.startedAtMs),
+          title: `任务失败：${jobName}`,
+          desc: (r.error || r.summary || `状态：${r.status}`).slice(0, 100),
+          time: runMs,
           color: 'text-status-error',
         });
       }
@@ -123,7 +131,7 @@ export default function NotificationBell() {
           icon: X,
           title: `任务已禁用：${j.name || '未知'}`,
           desc: '该定时任务当前未启用',
-          time: toMs(j.lastRunAtMs) || Date.now(),
+          time: toMs(j.lastRunAtMs),
           color: 'text-cl-text-muted',
         });
       }

@@ -322,16 +322,16 @@ async function readLogs(): Promise<unknown> {
     .filter((x): x is Record<string, string> => x !== null)
     .reverse();
 
-  // 3. 网关日志尾部（优先读系统位置，回退到旧位置）
-  const gateway = (await readLogTail(join(SYS_LOGS_DIR, 'gateway.log'), 200)).length > 0
+  // 3. 网关日志尾部（优先读系统位置，回退到旧位置）— 倒序：最新在前
+  const gateway = ((await readLogTail(join(SYS_LOGS_DIR, 'gateway.log'), 200)).length > 0
     ? await readLogTail(join(SYS_LOGS_DIR, 'gateway.log'), 200)
-    : await readLogTail(join(LOGS_DIR, 'gateway.log'), 150);
+    : await readLogTail(join(LOGS_DIR, 'gateway.log'), 150)).reverse();
 
-  // 4. 错误日志尾部（旧位置）
-  const errors = await readLogTail(join(LOGS_DIR, 'gateway.err.log'), 150);
+  // 4. 错误日志尾部（旧位置）— 倒序：最新在前
+  const errors = (await readLogTail(join(LOGS_DIR, 'gateway.err.log'), 150)).reverse();
 
-  // 5. 重启日志
-  const restarts = await readLogTail(join(LOGS_DIR, 'gateway-restart.log'), 100);
+  // 5. 重启日志 — 倒序：最新在前
+  const restarts = (await readLogTail(join(LOGS_DIR, 'gateway-restart.log'), 100)).reverse();
 
   // 6. 配置审计尾部（JSON Lines）
   const auditLines = await readLogTail(join(LOGS_DIR, 'config-audit.jsonl'), 100);
@@ -376,6 +376,8 @@ async function readLogs(): Promise<unknown> {
   // 统计
   const totalSize = files.reduce((s, f) => s + f.size, 0);
   const errorCount = errors.filter((l) => /\[error\]|\[ERROR\]|error|fail/i.test(l)).length;
+  // 文件列表按修改时间倒序（最新修改的在前）
+  files.sort((a, b) => b.modified.localeCompare(a.modified));
 
   return {
     files,
@@ -386,7 +388,7 @@ async function readLogs(): Promise<unknown> {
       errorCount,
       stabilityCount: stability.length,
       latestCommand: commands[0]?.timestamp ?? '',
-      latestGateway: gateway[gateway.length - 1]?.match(/^(\S+)/)?.[1] ?? '',
+      latestGateway: gateway[0]?.match(/^(\S+)/)?.[1] ?? '',
     },
     commands,
     gateway,
@@ -401,34 +403,8 @@ async function readLogs(): Promise<unknown> {
 async function readConfig(): Promise<unknown> {
   const raw = await readJsonFile<Record<string, unknown>>(join(OC_HOME, 'openclaw.json'));
   if (!raw) return { sections: [] };
-
-  // 脱敏：隐藏 key/secret/token 的明文
-  const SENSITIVE = /key|secret|token|password/i;
-  function mask(v: unknown): unknown {
-    if (typeof v === 'string') {
-      if (v.length <= 8) return '••••••';
-      return v.slice(0, 4) + '••••' + v.slice(-4);
-    }
-    return v;
-  }
-  function sanitize(obj: unknown): unknown {
-    if (obj === null || typeof obj !== 'object') return obj;
-    if (Array.isArray(obj)) return obj.map(sanitize);
-    const out: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
-      if (typeof v === 'string' && SENSITIVE.test(k)) {
-        out[k] = mask(v);
-      } else if (typeof v === 'object' && v !== null) {
-        out[k] = sanitize(v);
-      } else {
-        out[k] = v;
-      }
-    }
-    return out;
-  }
-
-  const safe = sanitize(raw) as Record<string, unknown>;
-  return safe;
+  // 注意：脱敏由前端 LeafValue 组件负责（默认脱敏 + 点击眼睛显示完整值）
+  return raw;
 }
 
 async function readPlugins(): Promise<{ plugins: Record<string, unknown>[] }> {
