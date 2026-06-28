@@ -71,6 +71,8 @@ function formatDuration(ms: number): string {
 export default function Dashboard() {
   const [status, setStatus] = useState<SystemStatus | null>(null);
   const [connectors, setConnectors] = useState<ConnectorItem[]>([]);
+  const [skillsCount, setSkillsCount] = useState(0);
+  const [extensionsCount, setExtensionsCount] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [lastRefresh, setLastRefresh] = useState(0);
@@ -79,12 +81,16 @@ export default function Dashboard() {
     try {
       setLoading(true);
       setError(null);
-      const [data, connData] = await Promise.all([
+      const [data, connData, skillsData, extData] = await Promise.all([
         fetchSystemStatus(),
         fetchJson<{ connectors: ConnectorItem[] }>('/connectors').catch(() => ({ connectors: [] as ConnectorItem[] })),
+        fetchJson<{ skills: unknown[] }>('/skills').catch(() => ({ skills: [] })),
+        fetchJson<{ extensions: unknown[] }>('/extensions').catch(() => ({ extensions: [] })),
       ]);
       setStatus(data);
       setConnectors(connData.connectors);
+      setSkillsCount(skillsData.skills.length);
+      setExtensionsCount(extData.extensions.length);
       setLastRefresh(Date.now());
     } catch (err) {
       setError(err instanceof Error ? err.message : '加载失败');
@@ -136,9 +142,10 @@ export default function Dashboard() {
 
   if (!status) return null;
 
-  const enabledPlugins = status.plugins.filter((p) => p.enabled).length;
   const enabledCron = status.cronJobs.filter((j) => j.enabled).length;
   const gatewayRunning = status.gateway.reachable;
+  const totalCapabilities = status.plugins.length + skillsCount + extensionsCount;
+  const capabilitiesBreakdown = `插件 ${status.plugins.length} · 技能 ${skillsCount} · 扩展 ${extensionsCount}`;
 
   return (
     <div className="space-y-6 animate-fade-in">
@@ -188,9 +195,9 @@ export default function Dashboard() {
           variant="brand"
         />
         <StatusCard
-          title="插件"
-          value={`${enabledPlugins}/${status.plugins.length}`}
-          subtitle="已启用 / 总数"
+          title="能力"
+          value={totalCapabilities}
+          subtitle={capabilitiesBreakdown}
           icon={<Puzzle size={20} />}
           variant="neutral"
         />
