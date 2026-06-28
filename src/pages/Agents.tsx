@@ -412,8 +412,8 @@ export default function Agents() {
                                   </span>
                                 </td>
                                 <td className="px-4 py-3 hidden md:table-cell">
-                                  <span className="label-small text-cl-text-secondary">
-                                    {session.model ?? '-'}
+                                  <span className={`label-small ${session.model ? 'text-cl-text-secondary' : 'text-cl-text-faint'}`}>
+                                    {session.model || '未启动'}
                                   </span>
                                 </td>
                                 <td className="px-4 py-3 text-right">

@@ -160,9 +160,12 @@ async function readSessions(): Promise<Record<string, unknown>> {
 
   sessions.sort((a, b) => (b.updatedAt as number) - (a.updatedAt as number));
 
+  // 默认模型取最近一个有 model 的会话（无 model 的会话是未交互/被中止的，不代表当前模型）
+  const defaultModel = sessions.find((s) => s.model)?.model || 'unknown';
+
   return {
     count: sessions.length,
-    defaults: { model: sessions[0]?.model || 'unknown', contextTokens: 1048576 },
+    defaults: { model: defaultModel, contextTokens: 1048576 },
     recent: sessions,
   };
 }
