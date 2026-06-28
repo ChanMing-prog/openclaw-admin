@@ -400,11 +400,58 @@ async function readLogs(): Promise<unknown> {
   };
 }
 
+// 加载 ~/.openclaw/.env 文件为 key-value 字典
+let cachedEnvFile: Record<string, string> | null = null;
+const ENV_FILE_CACHE_TTL_MS = 5_000;
+let envFileCacheExpires = 0;
+
+async function loadEnvFile(): Promise<Record<string, string>> {
+  if (cachedEnvFile && Date.now() < envFileCacheExpires) return cachedEnvFile;
+  const out: Record<string, string> = {};
+  const content = await readFile(join(OC_HOME, '.env'), 'utf8').catch(() => '');
+  for (const line of content.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const eqIdx = trimmed.indexOf('=');
+    if (eqIdx < 0) continue;
+    const k = trimmed.slice(0, eqIdx).trim();
+    const v = trimmed.slice(eqIdx + 1).trim().replace(/^["']|["']$/g, '');
+    if (k) out[k] = v;
+  }
+  cachedEnvFile = out;
+  envFileCacheExpires = Date.now() + ENV_FILE_CACHE_TTL_MS;
+  return out;
+}
+
+// 解析 $VAR 或 ${VAR} 引用，返回真实值；非引用原样返回
+async function resolveEnvRefs(value: unknown): Promise<unknown> {
+  if (typeof value !== 'string') return value;
+  // 完全匹配 $VAR 或 ${VAR}
+  const m = /^\$\{?([A-Z_][A-Z0-9_]*)\}?$/.exec(value);
+  if (m) {
+    const envVars = await loadEnvFile();
+    const real = envVars[m[1]];
+    return real ?? value; // 找不到则原样返回引用
+  }
+  return value;
+}
+
 async function readConfig(): Promise<unknown> {
   const raw = await readJsonFile<Record<string, unknown>>(join(OC_HOME, 'openclaw.json'));
   if (!raw) return { sections: [] };
-  // 注意：脱敏由前端 LeafValue 组件负责（默认脱敏 + 点击眼睛显示完整值）
-  return raw;
+  // 解析 $VAR 引用为真实值（从 ~/.openclaw/.env 读取），脱敏由前端 LeafValue 负责
+  async function resolveDeep(obj: unknown): Promise<unknown> {
+    if (obj === null || typeof obj !== 'object') return obj;
+    if (Array.isArray(obj)) return Promise.all(obj.map(resolveDeep));
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
+      if (typeof v === 'string') out[k] = await resolveEnvRefs(v);
+      else if (typeof v === 'object' && v !== null) out[k] = await resolveDeep(v);
+      else out[k] = v;
+    }
+    return out;
+  }
+  return resolveDeep(raw);
 }
 
 async function readPlugins(): Promise<{ plugins: Record<string, unknown>[] }> {
