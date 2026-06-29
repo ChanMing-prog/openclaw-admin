@@ -1469,6 +1469,11 @@ export default function openclawApiPlugin(): Plugin {
   return {
     name: 'openclaw-api',
     configureServer(server) {
+      // 预热用量缓存（后台异步，不阻塞服务器启动）
+      // 每隔 USAGE_CACHE_TTL_MS 自动刷新，确保首次请求秒级响应
+      readUsageCost().catch(() => {});
+      setInterval(() => { readUsageCost().catch(() => {}); }, USAGE_CACHE_TTL_MS);
+
       server.middlewares.use('/api', async (req, res) => {
         const url = new URL(req.url ?? '/', `http://${req.headers.host}`);
         const path = url.pathname;
