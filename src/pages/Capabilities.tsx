@@ -58,6 +58,7 @@ const PLUGIN_ZH: Record<string, string> = {
   'DingTalk Channel': '钉钉渠道：OpenClaw 钉钉官方连接插件',
   '@larksuite/openclaw-lark': '飞书渠道：OpenClaw 飞书/Lark 连接插件',
   'Feishu Channel': '飞书渠道：飞书消息收发与群聊管理',
+  'Feishu (Legacy)': '飞书旧版插件（已禁用）',
   'OpenClaw Web UI': 'Web 界面：基于浏览器的聊天交互界面',
 };
 

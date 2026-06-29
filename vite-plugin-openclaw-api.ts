@@ -659,28 +659,66 @@ async function readConfig(): Promise<unknown> {
 }
 
 async function readPlugins(): Promise<{ plugins: Record<string, unknown>[] }> {
-  // Known enabled plugins (from CLI output - stored in SQLite state DB which Vite can't access)
-  const knownEnabled: Record<string, unknown>[] = [
-    { name: 'Active Memory', enabled: true, description: '活跃记忆：在对话回复前运行记忆子代理，注入相关记忆到上下文', slot: 'memory-core' },
-    { name: '@openclaw/memory-core', enabled: true, description: '记忆核心：向量数据库存储与检索引擎', slot: 'memory-core' },
-    { name: '@openclaw/xiaomi-provider', enabled: true, description: '小米模型提供者：接入小米大模型 API', slot: 'provider' },
-    { name: 'DingTalk Channel', enabled: true, description: '钉钉渠道：OpenClaw 钉钉官方连接插件', slot: 'channel' },
-    { name: '@larksuite/openclaw-lark', enabled: true, description: '飞书渠道：OpenClaw 飞书/Lark 连接插件', slot: 'channel' },
-  ];
+  const cfg = await loadConfig();
+  const pluginsCfg = cfg.plugins as Record<string, unknown> | undefined;
+  const entries = (pluginsCfg?.entries ?? {}) as Record<string, Record<string, unknown>>;
+  const allow = (pluginsCfg?.allow ?? []) as string[];
 
-  // Also scan agent plugins dir for additional info
+  // 从 openclaw.json plugins.entries 读取所有已配置插件
+  const plugins: Record<string, unknown>[] = [];
+  const seen = new Set<string>();
+
+  // 已知插件的友好名称和描述映射
+  const pluginMeta: Record<string, { displayName: string; description: string; slot: string }> = {
+    'active-memory':       { displayName: 'Active Memory',             description: '活跃记忆：在对话回复前运行记忆子代理，注入相关记忆到上下文', slot: 'memory-core' },
+    'memory-core':         { displayName: '@openclaw/memory-core',     description: '记忆核心：向量数据库存储与检索引擎',                     slot: 'memory-core' },
+    'xiaomi':              { displayName: '@openclaw/xiaomi-provider', description: '小米模型提供者：接入小米大模型 API',                     slot: 'provider' },
+    'dingtalk-connector':  { displayName: 'DingTalk Channel',          description: '钉钉渠道：OpenClaw 钉钉官方连接插件',                   slot: 'channel' },
+    'openclaw-lark':       { displayName: '@larksuite/openclaw-lark',  description: '飞书渠道：OpenClaw 飞书/Lark 连接插件',                 slot: 'channel' },
+    'feishu':              { displayName: 'Feishu (Legacy)',           description: '飞书旧版插件（已禁用）',                               slot: 'channel' },
+  };
+
+  // 从 entries 构建列表
+  for (const [id, val] of Object.entries(entries)) {
+    const meta = pluginMeta[id];
+    plugins.push({
+      name: meta?.displayName ?? id,
+      enabled: val.enabled !== false,
+      description: meta?.description ?? '',
+      slot: meta?.slot ?? 'plugin',
+    });
+    seen.add(id.toLowerCase());
+  }
+
+  // 从 allow 补充 entries 中没有的
+  for (const id of allow) {
+    if (seen.has(id.toLowerCase())) continue;
+    const meta = pluginMeta[id];
+    plugins.push({
+      name: meta?.displayName ?? id,
+      enabled: true,
+      description: meta?.description ?? '',
+      slot: meta?.slot ?? 'plugin',
+    });
+    seen.add(id.toLowerCase());
+  }
+
+  // 扫描 agent plugins 目录，补充额外插件（跳过空目录）
   const agentPluginsDir = join(AGENTS_DIR, 'main/agent/plugins');
   try {
-    const entries = await readdir(agentPluginsDir, { withFileTypes: true });
-    for (const entry of entries) {
+    const dirEntries = await readdir(agentPluginsDir, { withFileTypes: true });
+    for (const entry of dirEntries) {
       if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
-      if (!knownEnabled.some(p => String(p.name).toLowerCase().includes(entry.name.toLowerCase()))) {
-        knownEnabled.push({ name: entry.name, enabled: true, description: '', slot: 'plugin' });
-      }
+      if (seen.has(entry.name.toLowerCase())) continue;
+      try {
+        const sub = await readdir(join(agentPluginsDir, entry.name));
+        if (sub.length === 0) continue;
+      } catch {}
+      plugins.push({ name: entry.name, enabled: true, description: '', slot: 'plugin' });
     }
   } catch {}
 
-  return { plugins: knownEnabled };
+  return { plugins };
 }
 
 async function readSkills(): Promise<{ skills: unknown[] }> {
@@ -968,16 +1006,24 @@ async function scanUsageEvents(): Promise<UsageEvent[]> {
   }
 
   // 收集候选文件（按 mtime 过滤）
-  const files: Array<{ path: string; agentId: string; sessionId: string }> = [];
+  const files: Array<{ path: string; agentId: string; sessionId: string; isTrajectory: boolean }> = [];
   for (const { sessionsDir, agentId } of agentDirs) {
     try {
       const entries = await readdir(sessionsDir);
       for (const name of entries) {
-        if (!name.endsWith('.jsonl') || name.endsWith('.trajectory.jsonl')) continue;
+        // 扫描 .jsonl 和 .trajectory.jsonl 两种文件
+        // .jsonl：type=message，含 message.usage（有 cost）
+        // .trajectory.jsonl：type=trace.artifacts，含 data.usage（无 cost，但包含全部 API 调用）
+        const isTrajectory = name.endsWith('.trajectory.jsonl');
+        const isRegularJsonl = name.endsWith('.jsonl') && !isTrajectory;
+        if (!isRegularJsonl && !isTrajectory) continue;
         const full = join(sessionsDir, name);
         const s = await stat(full);
         if (s.mtimeMs < lowerBoundMs) continue;
-        files.push({ path: full, agentId, sessionId: name.slice(0, -'.jsonl'.length) });
+        const sessionId = isTrajectory
+          ? name.replace(/\.trajectory\.jsonl$/, '')
+          : name.replace(/\.jsonl$/, '');
+        files.push({ path: full, agentId, sessionId, isTrajectory });
       }
     } catch {}
   }
@@ -1000,21 +1046,40 @@ async function scanUsageEvents(): Promise<UsageEvent[]> {
           } catch {
             continue;
           }
-          if (parsed.type !== 'message') continue;
-          const msg = parsed.message as Record<string, unknown> | undefined;
-          if (!msg || msg.role !== 'assistant') continue;
-          const usage = msg.usage as Record<string, unknown> | undefined;
+          // 解析两种格式：.jsonl（type=message）和 .trajectory.jsonl（type=trace.artifacts）
+          let usage: Record<string, unknown> | undefined;
+          let model = '';
+          let provider = '';
+          let tsMs = NaN;
+
+          if (f.isTrajectory) {
+            if (parsed.type !== 'trace.artifacts') continue;
+            const data = parsed.data as Record<string, unknown> | undefined;
+            usage = data?.usage as Record<string, unknown> | undefined;
+            model = String(parsed.modelId ?? '');
+            provider = String(parsed.provider ?? '');
+            const ts = String(parsed.ts ?? '');
+            tsMs = ts ? Date.parse(ts) : NaN;
+          } else {
+            if (parsed.type !== 'message') continue;
+            const msg = parsed.message as Record<string, unknown> | undefined;
+            if (!msg || msg.role !== 'assistant') continue;
+            usage = msg.usage as Record<string, unknown> | undefined;
+            model = String(msg.model ?? '');
+            provider = inferProvider(model);
+            const ts = String(parsed.timestamp ?? msg.timestamp ?? '');
+            tsMs = ts ? Date.parse(ts) : NaN;
+          }
+
           if (!usage) continue;
-          const ts = String(parsed.timestamp ?? msg.timestamp ?? '');
-          const tsMs = ts ? Date.parse(ts) : NaN;
           if (!Number.isFinite(tsMs) || tsMs < lowerBoundMs) continue;
           const ctx = sessionIndex.get(f.sessionId);
-          const model = String(msg.model ?? ctx?.model ?? '');
-          const provider = inferProvider(model);
-          const tokens = Number(
-            usage.totalTokens ??
-              Number(usage.input) + Number(usage.output) + Number(usage.cacheRead) + Number(usage.cacheWrite),
-          );
+          if (!model) model = String(ctx?.model ?? '');
+          if (!provider) provider = inferProvider(model);
+          // totalTokens: .jsonl 格式；total: .trajectory.jsonl 格式
+          const tokens = (usage.totalTokens != null ? Number(usage.totalTokens) : 0)
+            || (usage.total != null ? Number(usage.total) : 0)
+            || (Number(usage.input || 0) + Number(usage.output || 0) + Number(usage.cacheRead || 0) + Number(usage.cacheWrite || 0));
           const costObj = usage.cost as Record<string, unknown> | undefined;
           const ocCost = Number(costObj?.total ?? 0);
           // 优先用官方定价算人民币成本；无定价回退 OpenClaw 记录的美元成本
@@ -1039,7 +1104,20 @@ async function scanUsageEvents(): Promise<UsageEvent[]> {
   await Promise.all(
     Array.from({ length: Math.min(USAGE_SCAN_CONCURRENCY, Math.max(1, files.length)) }, worker),
   );
-  return events;
+
+  // 去重：.jsonl 和 .trajectory.jsonl 记录同一 API 调用，按 day+model+tokens 去重
+  // trajectory 文件更完整（含所有调用），但无 cost；jsonl 文件有 cost。优先保留有 cost 的
+  const deduped = new Map<string, UsageEvent>();
+  for (const e of events) {
+    // dedup key: 时间戳秒级 + 模型 + token 数（同一 API 调用不会有两个完全相同的记录）
+    const tsSec = e.timestamp.slice(0, 19); // 精确到秒
+    const key = `${tsSec}|${e.model ?? ''}|${e.tokens}`;
+    const existing = deduped.get(key);
+    if (!existing || (existing.cost === 0 && e.cost > 0)) {
+      deduped.set(key, e);
+    }
+  }
+  return [...deduped.values()];
 }
 
 function classifyUsagePace(current: number, baseline?: number): UsagePeriod['pace'] {
@@ -1339,7 +1417,7 @@ async function readConnectors(): Promise<{ connectors: ConnectorItem[]; generate
         : 'OpenClaw 网关未运行或 systemd 未配置重定向（检查 $OPENCLAW_SYS_LOGS_DIR）'),
   });
 
-  // 11. 用量数据（直接检查 sessions/*.jsonl 是否存在且有 usage 字段）
+  // 11. 用量数据（检查 sessions/*.jsonl 和 *.trajectory.jsonl 是否存在且有 usage 字段）
   let usageCount = 0;
   let usageSampleFound = false;
   const sampledFiles = new Set<string>();
@@ -1351,7 +1429,9 @@ async function readConnectors(): Promise<{ connectors: ConnectorItem[]; generate
       try {
         const files = await readdir(sessionsDir);
         for (const name of files) {
-          if (!name.endsWith('.jsonl') || name.endsWith('.trajectory.jsonl')) continue;
+          const isTraj = name.endsWith('.trajectory.jsonl');
+          const isJsonl = name.endsWith('.jsonl') && !isTraj;
+          if (!isJsonl && !isTraj) continue;
           usageCount++;
           // 只对前 3 个文件采样检查 usage 字段，找到即停止
           if (!usageSampleFound && sampledFiles.size < 3) {
