@@ -970,9 +970,16 @@ function inferProvider(model?: string): string {
   if (n.includes('deepseek')) return 'DeepSeek';
   if (n.includes('minimax')) return 'MiniMax';
   if (n.includes('sensenova')) return 'SenseNova';
-  if (n.includes('mimo')) return 'Xiaomi';
+  if (n.includes('mimo') || n.includes('xiaomi')) return 'Xiaomi';
   if (n.includes('qwen') || n.includes('llama') || n.includes('mistral')) return 'OSS/Other';
   return 'Unknown';
+}
+
+// 标准化 trajectory 文件中的原始 provider 名称为统一显示名
+// xiaomi-token-plan / mimo → Xiaomi, minimax / minimax-portal → MiniMax 等
+function normalizeProvider(raw?: string): string {
+  if (!raw) return 'Unknown';
+  return inferProvider(raw);
 }
 
 function classifySessionType(sessionKey?: string): 'Cron' | 'Discord' | 'Telegram' | 'Main' {
@@ -1057,7 +1064,7 @@ async function scanUsageEvents(): Promise<UsageEvent[]> {
             const data = parsed.data as Record<string, unknown> | undefined;
             usage = data?.usage as Record<string, unknown> | undefined;
             model = String(parsed.modelId ?? '');
-            provider = String(parsed.provider ?? '');
+            provider = normalizeProvider(String(parsed.provider ?? ''));
             const ts = String(parsed.ts ?? '');
             tsMs = ts ? Date.parse(ts) : NaN;
           } else {
