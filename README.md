@@ -188,7 +188,7 @@ docker run -it --rm \
 | 定时任务 | `<OC_HOME>/state/openclaw.sqlite` 的 `cron_jobs` 表 |
 | 任务执行记录 | `<OC_HOME>/state/openclaw.sqlite` 的 `cron_run_logs` 表 |
 | 用量数据 | `<OC_HOME>/agents/*/sessions/*.jsonl` 的 `message.usage` 字段 |
-| 插件 | 硬编码已知启用列表 + 扫描 `agents/main/agent/plugins/` |
+| 插件 | 读取 `openclaw.json` 配置 + 扫描 `<OC_HOME>/plugins/` 元数据 + 扫描 `agents/main/agent/plugins/` |
 | 技能 | 扫描 `<OC_HOME>/skills/` + `workspace/skills/` |
 | 扩展 | 扫描 `<OC_HOME>/extensions/` |
 | 记忆库 | `<workspace>/memory/` + ChromaDB SQLite |

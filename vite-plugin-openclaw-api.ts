@@ -61,6 +61,7 @@ const AGENTS_DIR = join(OC_HOME, 'agents');
 const CHROMA_DB = join(OC_HOME, 'memory/chroma_db/chroma.sqlite3');
 const SKILLS_DIR = join(OC_HOME, 'skills');
 const EXT_DIR = join(OC_HOME, 'extensions');
+const PLUGINS_DIR = join(OC_HOME, 'plugins');
 const OC_STATE_DB = join(OC_HOME, 'state/openclaw.sqlite');
 const LOGS_DIR = join(OC_HOME, 'logs');
 const SYS_LOGS_DIR = resolveSysLogsDir();
@@ -658,6 +659,37 @@ async function readConfig(): Promise<unknown> {
   return resolveDeep(raw);
 }
 
+async function readPluginMeta(pluginId: string, pluginDir?: string): Promise<{ displayName: string; description: string; slot: string }> {
+  const dir = pluginDir ?? join(PLUGINS_DIR, pluginId);
+  
+  // 尝试读取 package.json
+  const packageJson = await readJsonFile<{ name?: string; description?: string; slot?: string }>(join(dir, 'package.json'));
+  if (packageJson) {
+    return {
+      displayName: packageJson.name ?? pluginId,
+      description: packageJson.description ?? '',
+      slot: packageJson.slot ?? 'plugin',
+    };
+  }
+  
+  // 尝试读取 plugin.json
+  const pluginJson = await readJsonFile<{ name?: string; description?: string; slot?: string }>(join(dir, 'plugin.json'));
+  if (pluginJson) {
+    return {
+      displayName: pluginJson.name ?? pluginId,
+      description: pluginJson.description ?? '',
+      slot: pluginJson.slot ?? 'plugin',
+    };
+  }
+  
+  // 回退到默认值
+  return {
+    displayName: pluginId,
+    description: '',
+    slot: 'plugin',
+  };
+}
+
 async function readPlugins(): Promise<{ plugins: Record<string, unknown>[] }> {
   const cfg = await loadConfig();
   const pluginsCfg = cfg.plugins as Record<string, unknown> | undefined;
@@ -668,24 +700,25 @@ async function readPlugins(): Promise<{ plugins: Record<string, unknown>[] }> {
   const plugins: Record<string, unknown>[] = [];
   const seen = new Set<string>();
 
-  // 已知插件的友好名称和描述映射
-  const pluginMeta: Record<string, { displayName: string; description: string; slot: string }> = {
-    'active-memory':       { displayName: 'Active Memory',             description: '活跃记忆：在对话回复前运行记忆子代理，注入相关记忆到上下文', slot: 'memory-core' },
-    'memory-core':         { displayName: '@openclaw/memory-core',     description: '记忆核心：向量数据库存储与检索引擎',                     slot: 'memory-core' },
-    'xiaomi':              { displayName: '@openclaw/xiaomi-provider', description: '小米模型提供者：接入小米大模型 API',                     slot: 'provider' },
-    'dingtalk-connector':  { displayName: 'DingTalk Channel',          description: '钉钉渠道：OpenClaw 钉钉官方连接插件',                   slot: 'channel' },
-    'openclaw-lark':       { displayName: '@larksuite/openclaw-lark',  description: '飞书渠道：OpenClaw 飞书/Lark 连接插件',                 slot: 'channel' },
-    'feishu':              { displayName: 'Feishu (Legacy)',           description: '飞书旧版插件（已禁用）',                               slot: 'channel' },
+  // 已知插件的 slot 映射（用于回退）
+  const pluginSlotMap: Record<string, string> = {
+    'active-memory': 'memory-core',
+    'memory-core': 'memory-core',
+    'xiaomi': 'provider',
+    'dingtalk-connector': 'channel',
+    'openclaw-lark': 'channel',
+    'feishu': 'channel',
   };
 
   // 从 entries 构建列表
   for (const [id, val] of Object.entries(entries)) {
-    const meta = pluginMeta[id];
+    const fileMeta = await readPluginMeta(id);
+    const slot = fileMeta.slot !== 'plugin' ? fileMeta.slot : (pluginSlotMap[id] ?? 'plugin');
     plugins.push({
-      name: meta?.displayName ?? id,
+      name: fileMeta.displayName,
       enabled: val.enabled !== false,
-      description: meta?.description ?? '',
-      slot: meta?.slot ?? 'plugin',
+      description: fileMeta.description,
+      slot,
     });
     seen.add(id.toLowerCase());
   }
@@ -693,12 +726,13 @@ async function readPlugins(): Promise<{ plugins: Record<string, unknown>[] }> {
   // 从 allow 补充 entries 中没有的
   for (const id of allow) {
     if (seen.has(id.toLowerCase())) continue;
-    const meta = pluginMeta[id];
+    const fileMeta = await readPluginMeta(id);
+    const slot = fileMeta.slot !== 'plugin' ? fileMeta.slot : (pluginSlotMap[id] ?? 'plugin');
     plugins.push({
-      name: meta?.displayName ?? id,
+      name: fileMeta.displayName,
       enabled: true,
-      description: meta?.description ?? '',
-      slot: meta?.slot ?? 'plugin',
+      description: fileMeta.description,
+      slot,
     });
     seen.add(id.toLowerCase());
   }
@@ -714,7 +748,13 @@ async function readPlugins(): Promise<{ plugins: Record<string, unknown>[] }> {
         const sub = await readdir(join(agentPluginsDir, entry.name));
         if (sub.length === 0) continue;
       } catch {}
-      plugins.push({ name: entry.name, enabled: true, description: '', slot: 'plugin' });
+      const fileMeta = await readPluginMeta(entry.name, join(agentPluginsDir, entry.name));
+      plugins.push({
+        name: fileMeta.displayName,
+        enabled: true,
+        description: fileMeta.description,
+        slot: fileMeta.slot,
+      });
     }
   } catch {}
 
